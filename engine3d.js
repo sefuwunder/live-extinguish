@@ -167,14 +167,20 @@ attribute vec3 aPos;
 attribute vec3 aNor;
 attribute vec4 aCol;
 attribute float aEmi;
+attribute vec2 aSway;   // x: phase, y: amplitude scale (0 = no sway)
 uniform mat4 uMVP;
 uniform vec3 uLightDir;
 uniform vec3 uAmbient;
+uniform float uSwayTime;
+uniform float uSwayAmp;
 varying vec4 vCol;
 varying float vFog;
 uniform vec2 uFogRange;
 void main() {
-  vec4 clip = uMVP * vec4(aPos, 1.0);
+  vec3 p = aPos;
+  // wind sway: sideways offset proportional to vertex height and amplitude
+  p.x += sin(uSwayTime + aSway.x) * uSwayAmp * aSway.y * max(p.y, 0.0);
+  vec4 clip = uMVP * vec4(p, 1.0);
   gl_Position = clip;
   float diff = max(dot(normalize(aNor), normalize(uLightDir)), 0.0);
   vec3 lit = aCol.rgb * (uAmbient + diff * (vec3(1.0, 0.97, 0.92) - uAmbient));
@@ -235,6 +241,7 @@ function createRenderer(canvas) {
     nor: gl.getAttribLocation(program, "aNor"),
     col: gl.getAttribLocation(program, "aCol"),
     emi: gl.getAttribLocation(program, "aEmi"),
+    swa: gl.getAttribLocation(program, "aSway"),
   };
   const U = {
     mvp: gl.getUniformLocation(program, "uMVP"),
@@ -242,6 +249,8 @@ function createRenderer(canvas) {
     ambient: gl.getUniformLocation(program, "uAmbient"),
     fogColor: gl.getUniformLocation(program, "uFogColor"),
     fogRange: gl.getUniformLocation(program, "uFogRange"),
+    swayTime: gl.getUniformLocation(program, "uSwayTime"),
+    swayAmp: gl.getUniformLocation(program, "uSwayAmp"),
   };
   gl.enable(gl.DEPTH_TEST);
   gl.depthFunc(gl.LEQUAL);
@@ -254,7 +263,7 @@ function createRenderer(canvas) {
 
   function makeLayer() {
     const bufs = {};
-    for (const k of ["pos", "nor", "col", "emi", "idx"]) bufs[k] = gl.createBuffer();
+    for (const k of ["pos", "nor", "col", "emi", "swa", "idx"]) bufs[k] = gl.createBuffer();
     return { bufs, opaqueCount: 0, transCount: 0 };
   }
   function concatF32(a, b) {
@@ -262,6 +271,7 @@ function createRenderer(canvas) {
     o.set(a, 0); o.set(b, a.length);
     return o;
   }
+  function zeros(n) { return new Float32Array(n); }
   // Upload a {opaque, trans} geometry into one layer: attributes concatenated,
   // trans indices appended after opaque with a vertex offset. Draw uses
   // drawElements offsets to separate the two passes.
@@ -273,6 +283,10 @@ function createRenderer(canvas) {
     gl.bindBuffer(gl.ARRAY_BUFFER, B.nor); gl.bufferData(gl.ARRAY_BUFFER, concatF32(op.nor, tr.nor), gl.STATIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, B.col); gl.bufferData(gl.ARRAY_BUFFER, concatF32(op.col, tr.col), gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, B.emi); gl.bufferData(gl.ARRAY_BUFFER, concatF32(op.emi, tr.emi), gl.STATIC_DRAW);
+    // sway is optional: legacy layers without it get a zero-filled buffer
+    const opSwa = op.swa || zeros(vOff * 2);
+    const trSwa = tr.swa || zeros((tr.pos.length / 3) * 2);
+    gl.bindBuffer(gl.ARRAY_BUFFER, B.swa); gl.bufferData(gl.ARRAY_BUFFER, concatF32(opSwa, trSwa), gl.STATIC_DRAW);
     const idx = new IDX_ARR(op.idx.length + tr.idx.length);
     idx.set(op.idx, 0);
     for (let i = 0; i < tr.idx.length; i++) idx[op.idx.length + i] = tr.idx[i] + vOff;
@@ -295,6 +309,8 @@ function createRenderer(canvas) {
     gl.enableVertexAttribArray(A.col); gl.vertexAttribPointer(A.col, 4, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, B.emi);
     gl.enableVertexAttribArray(A.emi); gl.vertexAttribPointer(A.emi, 1, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, B.swa);
+    gl.enableVertexAttribArray(A.swa); gl.vertexAttribPointer(A.swa, 2, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, B.idx);
   }
   function draw(layer, mvp, lightDir, ambient, fogColor, fogRange) {
@@ -325,6 +341,12 @@ function createRenderer(canvas) {
     gl, canvas, makeLayer, upload, updateColors, draw,
     resize(w, h) { gl.viewport(0, 0, w, h); },
     clear() { gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); },
+    // Wind sway: time (seconds, monotonic) and amplitude (0 = still air).
+    // Amplitude ≈ ±3° for grass/flowers, ±1° for trees (set per-vertex).
+    setSway(time, amp) {
+      gl.uniform1f(U.swayTime, time);
+      gl.uniform1f(U.swayAmp, amp);
+    },
   };
 }
 
@@ -337,6 +359,7 @@ function Scene3D(renderer, Models) {
   this.terrainLayer = renderer.makeLayer();
   this.gapLayer = renderer.makeLayer();
   this.plantLayer = renderer.makeLayer();
+  this.decorLayer = renderer.makeLayer();
   this.fxLayer = renderer.makeLayer();
   // terrain static data (positions/normals/indices) + per-vertex meta for colors
   this.terrain = null; // {geo, meta, heights, idxOf}
@@ -432,15 +455,17 @@ Scene3D.prototype.buildPlants = function (grids, rand, now) {
       if (p) {
         const g = p.growth;
         let m = M.mTranslate(w.x, topY, w.z);
+        // per-plant variation, deterministic per tile (no two plants identical)
+        const jitter = M.plantJitter(tile.shade, x, y);
         if (p.kind === "grass") {
-          const L = M.grassTuft(rand, g);
+          const L = M.grassTuft(rand, g, jitter);
           this._mergeAt(b, L, m, cold);
         } else if (p.kind === "flower") {
           const colorIdx = (x * 7 + y * 13) % M.PAL.petals.length;
-          const L = M.flower(rand, g, colorIdx);
+          const L = M.flower(rand, g, colorIdx, jitter);
           this._mergeAt(b, L, m, cold);
         } else {
-          const L = M.tree(rand, g);
+          const L = M.tree(rand, g, jitter);
           this._mergeAt(b, L, m, cold);
           if (g > 40) {
             // blob shadow
@@ -481,7 +506,7 @@ Scene3D.prototype._mergeAt = function (batcher, finished, matrix, cold) {
       }
     }
     M.mergeLayer(batcher, { pos: new Float32Array(pts), nor: new Float32Array(nrs),
-      col: new Float32Array(cols), emi: layer.emi, idx: layer.idx });
+      col: new Float32Array(cols), emi: layer.emi, swa: layer.swa, idx: layer.idx });
   }
 };
 
@@ -576,7 +601,7 @@ Scene3D.prototype._mergeRaw = function (batcher, layer, matrix) {
     pts.push(pt[0], pt[1], pt[2]); nrs.push(nr[0], nr[1], nr[2]);
   }
   M.mergeLayer(batcher, { pos: new Float32Array(pts), nor: new Float32Array(nrs),
-    col: layer.col, emi: layer.emi, idx: layer.idx });
+    col: layer.col, emi: layer.emi, swa: layer.swa, idx: layer.idx });
 };
 
 // ---- orchestration: upload + draw ----
@@ -584,6 +609,7 @@ Scene3D.prototype.syncTerrain = function (grids, rand, now) {
   this.buildTerrain(grids, rand);
   this.r.upload(this.terrainLayer, this.terrain.geo);
   this.r.upload(this.gapLayer, this.terrain.gapGeo);
+  this.r.upload(this.decorLayer, this.buildDecor(grids));
   this.refreshTerrainColors(grids, now);
 };
 Scene3D.prototype.refreshTerrainColors = function (grids, now) {
@@ -594,9 +620,33 @@ Scene3D.prototype.refreshTerrainColors = function (grids, now) {
 Scene3D.prototype.syncPlants = function (grids, rand, now) {
   this.r.upload(this.plantLayer, this.buildPlants(grids, rand, now));
 };
+// Strewn ephemera: one batched layer per scene, purely visual —
+// never blocks placement or growth. Built per season from grid.decor.
+Scene3D.prototype.buildDecor = function (grids) {
+  const M = this.M;
+  const b = new M.Batcher();
+  for (const key of this.plotKeys) {
+    const grid = grids[key];
+    if (!grid.decor) continue;
+    for (const d of grid.decor) {
+      const ti = (key === "fishkill" ? 0 : SIZE16 * SIZE16) + d.y * SIZE16 + d.x;
+      const topY = this.terrain ? this.terrain.heights[ti] : 0;
+      const w = tileToWorld(key, d.x, d.y);
+      const ox = (M.frac(d.rot * 1.7) - 0.5) * 0.4;
+      const oz = (M.frac(d.rot * 2.3) - 0.5) * 0.4;
+      const m = M.mMul(
+        M.mTranslate(w.x + ox, topY + 0.015, w.z + oz),
+        M.mMul(M.mScale(d.scale, d.scale, d.scale), M.mRotY(d.rot))
+      );
+      const L = M.decorItem(d.kind, this._decorRand || (this._decorRand = mulberryLike(7)));
+      this._mergeAt(b, L, m, false);
+    }
+  }
+  return b.finish();
+};
 // Per-frame: rebuild fx, compute matrices, draw everything.
 Scene3D.prototype.renderFrame = function (state) {
-  // state: {grids, falling, now, reducedMotion, seasonProgress, rand, sway}
+  // state: {grids, falling, now, reducedMotion, seasonProgress, rand, wind}
   const r = this.r;
   const fx = this.buildFx(state);
   r.upload(this.fxLayer, fx);
@@ -612,8 +662,11 @@ Scene3D.prototype.renderFrame = function (state) {
   const ambient = [0.55, 0.52, 0.48];
   const fogColor = [0.93, 0.90, 0.83];
   r.clear();
+  // wind sway in the vertex shader; fully off under reduced-motion
+  r.setSway(state.now / 1000, state.reducedMotion ? 0 : 0.02 + (state.wind || 0) * 0.05);
   r.draw(this.gapLayer, mvp, light, ambient, fogColor, [45, 120]);
   r.draw(this.terrainLayer, mvp, light, ambient, fogColor, [45, 120]);
+  r.draw(this.decorLayer, mvp, light, ambient, fogColor, [45, 120]);
   r.draw(this.plantLayer, mvp, light, ambient, fogColor, [45, 120]);
   r.draw(this.fxLayer, mvp, light, ambient, fogColor, [45, 120]);
 };

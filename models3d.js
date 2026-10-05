@@ -36,6 +36,42 @@ const PAL = {
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 function mix3(c1, c2, t) { return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)]; }
+function frac(x) { return x - Math.floor(x); }
+// Ease-out: fast early growth, slow approach to maturity.
+function easeOutCubic(t) {
+  t = Math.max(0, Math.min(1, t));
+  return 1 - Math.pow(1 - t, 3);
+}
+// Deterministic per-plant RNG from a seed (stable across frames/ticks).
+function hashRand(seed) {
+  let a = (seed >>> 0) || 1;
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Subtle warm/cool hue variation so no two plants are identical.
+function hueShift(c, amt) {
+  if (!amt) return c;
+  return mix3(c, [0.78, 0.66, 0.30], amt);
+}
+// Per-plant variation, deterministic per tile: ±15% scale, full rotation
+// variety, slight hue offset, and a stable sway phase.
+function plantJitter(shade, x, y) {
+  const r = hashRand(((Math.floor((shade == null ? 0.5 : shade) * 1e6)) ^ (x * 1009) ^ (y * 1013) ^ 0x9e37) >>> 0);
+  return {
+    scale: 0.85 + r() * 0.3,
+    rot: r() * Math.PI * 2,
+    hue: (r() - 0.5) * 0.14,
+    phase: r() * Math.PI * 2,
+    rand: r,
+  };
+}
+function defaultJitter(rand) {
+  return { scale: 1, rot: 0, hue: 0, phase: 0, rand: rand || Math.random };
+}
 
 /* ---------------- tiny mat4 (compose only) ---------------- */
 function mIdent() { return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; }
@@ -78,12 +114,14 @@ function compose(x, y, z, sx, sy, sz, rotY) {
 
 /* ---------------- Batcher ---------------- */
 function Batcher() {
-  this.op = { p: [], n: [], c: [], e: [], idx: [] };
-  this.tr = { p: [], n: [], c: [], e: [], idx: [] };
+  this.op = { p: [], n: [], c: [], e: [], idx: [], s: [] };
+  this.tr = { p: [], n: [], c: [], e: [], idx: [], s: [] };
 }
 // chunk: {p,n,c,e,idx}; c may be [r,g,b] or [r,g,b,a] or per-vertex flat array;
 // e may be a single number or per-vertex array. m: mat4|null. alpha<1 forces transparent pass.
-Batcher.prototype.add = function (chunk, m, tint) {
+// sway: optional [phase, ampScale] — wind sway, applied per-vertex in the shader,
+// offset proportional to vertex height. Defaults to [0,0] (no sway).
+Batcher.prototype.add = function (chunk, m, tint, sway) {
   // Single-color chunks: [r,g,b] opaque, [r,g,b,a] transparent when a<1.
   // Per-vertex color chunks are always treated as opaque rgb.
   const nv = chunk.p.length / 3;
@@ -93,6 +131,7 @@ Batcher.prototype.add = function (chunk, m, tint) {
   const base = bucket.p.length / 3;
   const perVertE = Array.isArray(chunk.e);
   const hasA = chunk.c.length === nv * 4;
+  const sw = sway || [0, 0];
   for (let i = 0; i < nv; i++) {
     let pt = [chunk.p[i*3], chunk.p[i*3+1], chunk.p[i*3+2]];
     let nr = [chunk.n[i*3], chunk.n[i*3+1], chunk.n[i*3+2]];
@@ -105,6 +144,7 @@ Batcher.prototype.add = function (chunk, m, tint) {
     if (tint) { r *= tint[0]; g *= tint[1]; b *= tint[2]; }
     bucket.c.push(r, g, b, a);
     bucket.e.push(perVertE ? chunk.e[i] : (typeof chunk.e === "number" ? chunk.e : 0));
+    bucket.s.push(sw[0], sw[1]);
   }
   for (let i = 0; i < chunk.idx.length; i++) bucket.idx.push(base + chunk.idx[i]);
 };
@@ -112,6 +152,7 @@ function toLayer(b) {
   return {
     pos: new Float32Array(b.p), nor: new Float32Array(b.n),
     col: new Float32Array(b.c), emi: new Float32Array(b.e),
+    swa: new Float32Array(b.s),
     idx: new Uint16Array(b.idx), count: b.idx.length,
   };
 }
@@ -237,61 +278,168 @@ function streak(w, h, color) {
 }
 
 /* ---------------- composite models ---------------- */
-function grassTuft(rand, growth) {
-  // growth 0..100 → g 0..1
-  const g = Math.max(0.08, Math.min(1, growth / 100));
+// Mature visual heights in tile units: grass ~0.28, flower ~0.5, tree ~2.2.
+// Stages morph (blade counts / sprout→bud→bloom / sapling→young→mature),
+// not just scale. easeOutCubic: fast early, slow to mature.
+// jitter (plantJitter): ±15% scale, rotation, hue offset, sway phase.
+function grassTuft(rand, growth, jitter) {
+  const g = easeOutCubic(Math.max(0.02, Math.min(1, growth / 100)));
+  const j = jitter || defaultJitter(rand);
+  const pr = j.rand || rand;
   const b = new Batcher();
-  const blades = 4;
+  // sparse tuft → full tuft: blade count grows with maturity
+  const blades = g < 0.35 ? 3 : g < 0.7 ? 4 : 6;
+  const sway = [j.phase, 1.0];
   for (let i = 0; i < blades; i++) {
-    const a = (i / blades) * Math.PI * 2 + rand() * 0.8;
-    const tilt = 0.12 + rand() * 0.22;
-    const h = (0.30 + rand() * 0.25) * (0.35 + 0.65 * g);
-    const m = compose(Math.cos(a) * 0.16, 0, Math.sin(a) * 0.16, 1, 1, 1, 0);
+    const a = (i / blades) * Math.PI * 2 + j.rot + pr() * 0.6;
+    const tilt = 0.10 + pr() * 0.25;
+    const h = (0.16 + pr() * 0.12) * g; // mature ≈ 0.28 tall
+    if (h < 0.01) continue;
+    const m = compose(Math.cos(a) * 0.14, 0, Math.sin(a) * 0.14, j.scale, j.scale, j.scale, 0);
     const lean = mMul(mTranslate(Math.cos(a) * tilt * h * 0.5, 0, Math.sin(a) * tilt * h * 0.5), m);
-    b.add(cone(0.07, h, 5, mix3(PAL.grassA, PAL.grassB, g * (0.4 + rand() * 0.6))), lean);
+    const col = hueShift(mix3(PAL.grassA, PAL.grassB, g * (0.3 + pr() * 0.7)), j.hue);
+    b.add(cone(0.045, h, 4, col), lean, null, sway);
   }
   return b.finish();
 }
 
-function flower(rand, growth, colorIdx) {
-  const g = Math.max(0.1, Math.min(1, growth / 100));
+function flower(rand, growth, colorIdx, jitter) {
+  const g = easeOutCubic(Math.max(0.02, Math.min(1, growth / 100)));
+  const j = jitter || defaultJitter(rand);
+  const pr = j.rand || rand;
   const b = new Batcher();
-  const stemH = 0.25 + 0.45 * g;
-  b.add(cyl(0.025, 0.035, stemH, 6, PAL.stem), mTranslate(0, 0, 0));
-  const petal = PAL.petals[colorIdx % PAL.petals.length];
-  const pr = 0.09 + 0.10 * g;
+  const stemH = 0.14 + 0.30 * g; // mature ≈ 0.44 + bloom
+  const sway = [j.phase, 1.0];
+  b.add(cyl(0.022, 0.032, stemH, 5, hueShift(PAL.stem, j.hue)),
+    mTranslate(0, 0, 0), null, sway);
+  if (g < 0.3) {
+    // sprout: two tiny leaves, no head
+    for (const s of [-1, 1]) {
+      b.add(cone(0.035, 0.12 * g / 0.3, 4, hueShift(PAL.grassB, j.hue)),
+        compose(s * 0.05, stemH * 0.5, 0, j.scale, j.scale, j.scale, 0), null, sway);
+    }
+    return b.finish();
+  }
+  const petal = hueShift(PAL.petals[colorIdx % PAL.petals.length], j.hue);
+  const pr0 = 0.05 + 0.055 * g;
+  if (g < 0.65) {
+    // bud: closed green head
+    b.add(sphere(pr0 * 0.6, 6, hueShift(mix3(PAL.stem, PAL.grassA, 0.5), j.hue)),
+      compose(0, stemH, 0, j.scale, 1.3 * j.scale, j.scale, 0), null, sway);
+    return b.finish();
+  }
+  // bloom: petals only at maturity
   for (let i = 0; i < 5; i++) {
-    const a = (i / 5) * Math.PI * 2 + rand() * 0.5;
-    const m = compose(Math.cos(a) * pr, stemH, Math.sin(a) * pr, 1, 0.45, 1, 0);
-    b.add(sphere(pr * 0.62, 6, petal), m);
+    const a = (i / 5) * Math.PI * 2 + j.rot + pr() * 0.4;
+    const m = compose(Math.cos(a) * pr0, stemH, Math.sin(a) * pr0, j.scale, 0.45, j.scale, 0);
+    b.add(sphere(pr0 * 0.62, 5, petal), m, null, sway);
   }
-  b.add(sphere(pr * 0.45, 6, PAL.petalCenter), mTranslate(0, stemH + pr * 0.2, 0));
+  b.add(sphere(pr0 * 0.45, 5, PAL.petalCenter), mTranslate(0, stemH + pr0 * 0.2, 0), null, sway);
   return b.finish();
 }
 
-function tree(rand, growth) {
-  const g = Math.max(0.12, Math.min(1, growth / 100));
+function tree(rand, growth, jitter) {
+  const g = easeOutCubic(Math.max(0.02, Math.min(1, growth / 100)));
+  const j = jitter || defaultJitter(rand);
+  const pr = j.rand || rand;
   const b = new Batcher();
-  const trunkH = 0.35 + 0.85 * g;
-  b.add(cyl(0.07 + 0.05 * g, 0.10 + 0.06 * g, trunkH, 7, PAL.trunk), mTranslate(0, 0, 0));
-  const cr = 0.32 + 0.55 * g;
-  const leaf = mix3(PAL.leafA, PAL.leafB, 0.3 + rand() * 0.5);
-  b.add(sphere(cr, 8, leaf), mTranslate(0, trunkH + cr * 0.75, 0));
-  b.add(sphere(cr * 0.62, 7, mix3(leaf, PAL.leafA, 0.4)), mTranslate(-cr * 0.35, trunkH + cr * 0.35, cr * 0.2));
-  b.add(sphere(cr * 0.5, 7, mix3(leaf, PAL.leafB, 0.3)), mTranslate(cr * 0.3, trunkH + cr * 1.15, -cr * 0.15));
+  const trunkH = 0.22 + 0.88 * g; // mature ≈ 1.1
+  const sway = [j.phase, 0.33]; // trees barely sway
+  b.add(cyl((0.05 + 0.045 * g) * j.scale, (0.075 + 0.06 * g) * j.scale, trunkH, 6,
+      hueShift(PAL.trunk, j.hue * 0.5)), mIdent(), null, [j.phase, 0.15]);
+  if (g < 0.3) {
+    // sapling: bare stem with a tuft of young leaves at the tip
+    b.add(sphere(0.10 * g / 0.3, 6, hueShift(mix3(PAL.leafA, PAL.grassB, 0.4), j.hue)),
+      mTranslate(0, trunkH, 0), null, sway);
+    return b.finish();
+  }
+  const leaf = hueShift(mix3(PAL.leafA, PAL.leafB, 0.3 + pr() * 0.5), j.hue);
+  if (g < 0.7) {
+    // young: single small canopy
+    const cr = 0.30 + 0.25 * g;
+    b.add(sphere(cr, 7, leaf), mTranslate(0, trunkH + cr * 0.7, 0), null, sway);
+    return b.finish();
+  }
+  // mature: full layered canopy, top ≈ 2.3 tile units
+  const cr = 0.42 + 0.28 * g;
+  b.add(sphere(cr, 8, leaf), mTranslate(0, trunkH + cr * 0.75, 0), null, sway);
+  b.add(sphere(cr * 0.62, 7, hueShift(mix3(leaf, PAL.leafA, 0.4), j.hue)),
+    mTranslate(-cr * 0.35, trunkH + cr * 0.35, cr * 0.2), null, sway);
+  b.add(sphere(cr * 0.5, 7, hueShift(mix3(leaf, PAL.leafB, 0.3), j.hue)),
+    mTranslate(cr * 0.3, trunkH + cr * 1.15, -cr * 0.15), null, sway);
   return b.finish();
 }
 
-// Flame: outer + inner cone. flicker 0..1 scales height (applied by scene per frame).
+// Flame: outer + inner cone, ~40% smaller than before. flicker 0..1 scales
+// height (applied by scene per frame).
 function flame(flicker) {
   const b = new Batcher();
   const f = 0.75 + 0.5 * flicker;
-  b.add(cone(0.22, 0.85 * f, 7, PAL.fireA), mTranslate(0, 0, 0));
-  b.add(cone(0.12, 0.55 * f, 6, PAL.fireB), mTranslate(0, 0.05, 0));
+  b.add(cone(0.13, 0.51 * f, 7, PAL.fireA), mTranslate(0, 0, 0));
+  b.add(cone(0.07, 0.33 * f, 6, PAL.fireB), mTranslate(0, 0.03, 0));
   // emissive so flames glow regardless of light
   const L = b.finish();
   L.opaque.emi.fill(0.85);
   return L;
+}
+
+// Flat horizontal quad in XZ plane at y=0 (for leaves, feathers).
+function quad(color) {
+  return chunk(
+    [-0.5, 0, -0.5, 0.5, 0, -0.5, 0.5, 0, 0.5, -0.5, 0, 0.5],
+    [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0],
+    color, [0, 2, 1, 0, 3, 2]
+  );
+}
+
+// Ephemera: strewn ground litter, purely decorative, one batched draw each.
+// kind: leaf|twig|stone|pinecone|feather|pebble|paper|bottlecap|button
+function decorItem(kind, rand) {
+  const b = new Batcher();
+  const R = rand || Math.random;
+  switch (kind) {
+    case "leaf": { // small quad, muted autumn colors
+      const autumn = [[0.62, 0.42, 0.20], [0.55, 0.36, 0.22], [0.48, 0.44, 0.20], [0.66, 0.50, 0.26]];
+      const c = autumn[Math.floor(R() * autumn.length)];
+      b.add(quad(c), compose(0, 0.01, 0, 0.28, 1, 0.20, 0));
+      break;
+    }
+    case "twig": // thin brown cylinder lying flat
+      b.add(cyl(0.012, 0.018, 0.22, 4, PAL.trunk), compose(0, 0.02, 0, 1, 1, 1, Math.PI / 2 * 0.96));
+      break;
+    case "stone": case "pebble": { // grey low-poly blob
+      const r = kind === "stone" ? 0.09 : 0.055;
+      const g = 0.52 + R() * 0.12;
+      b.add(sphere(r, 5, [g, g, g * 0.98]), compose(0, 0, 0, 1.3, 0.5, 1.0, 0));
+      break;
+    }
+    case "pinecone": // small brown cone lying low
+      b.add(cone(0.05, 0.14, 6, [0.36, 0.24, 0.14]), compose(0, 0.02, 0, 1, 1, 1, Math.PI / 2 * 1.05));
+      break;
+    case "feather": // tiny white quad, slightly raised
+      b.add(quad([0.88, 0.86, 0.80]), compose(0, 0.012, 0, 0.10, 1, 0.32, 0));
+      break;
+    case "paper": { // crumpled off-white ball, low segments
+      const g = 0.82 + R() * 0.08;
+      b.add(sphere(0.07, 5, [g, g * 0.97, g * 0.92]), compose(0, 0.04, 0, 1.1, 0.85, 1.0, 0));
+      break;
+    }
+    case "bottlecap": { // tiny metallic cylinder, red or silver
+      const c = R() < 0.5 ? [0.62, 0.18, 0.14] : [0.72, 0.74, 0.76];
+      const cap = cyl(0.045, 0.045, 0.02, 8, c);
+      cap.e = 0.35;
+      b.add(cap, mTranslate(0, 0.012, 0));
+      break;
+    }
+    case "button": // lost button: small cylinder, muted colors
+      b.add(cyl(0.028, 0.028, 0.012, 8,
+        [[0.42, 0.36, 0.30], [0.30, 0.38, 0.42], [0.52, 0.28, 0.26]][Math.floor(R() * 3)]),
+        mTranslate(0, 0.008, 0));
+      break;
+    default:
+      b.add(box(0.06, 0.02, 0.06, [0.5, 0.5, 0.5]), mTranslate(0, 0.01, 0));
+  }
+  return b.finish();
 }
 
 function smokePuff(t) {
@@ -385,6 +533,8 @@ function mergeLayer(batcher, finished) {
       bucket.n.push(layer.nor[i*3], layer.nor[i*3+1], layer.nor[i*3+2]);
       bucket.c.push(layer.col[i*4], layer.col[i*4+1], layer.col[i*4+2], layer.col[i*4+3]);
       bucket.e.push(layer.emi[i]);
+      if (layer.swa) bucket.s.push(layer.swa[i*2], layer.swa[i*2+1]);
+      else bucket.s.push(0, 0);
     }
     for (let i = 0; i < layer.idx.length; i++) bucket.idx.push(base + layer.idx[i]);
   }
@@ -411,7 +561,7 @@ function translateLayer(finished, x, y, z) {
     for (let i = 0; i < L.pos.length; i += 3) {
       p[i] = L.pos[i] + x; p[i+1] = L.pos[i+1] + y; p[i+2] = L.pos[i+2] + z;
     }
-    out[k] = { pos: p, nor: L.nor, col: L.col, emi: L.emi, idx: L.idx };
+    out[k] = { pos: p, nor: L.nor, col: L.col, emi: L.emi, swa: L.swa, idx: L.idx };
   }
   return out;
 }
@@ -436,10 +586,10 @@ function validIndices(layer) {
 }
 
 const Models3D = {
-  PAL, lerp, mix3,
+  PAL, lerp, mix3, frac, easeOutCubic, hashRand, hueShift, plantJitter, defaultJitter,
   mIdent, mTranslate, mScale, mRotY, mMul, compose, xformPoint, xformNormal,
-  Batcher, chunk, box, cone, cyl, sphere, disc, streak,
-  grassTuft, flower, tree, flame, smokePuff, cloudCluster, sunBall, skyDome,
+  Batcher, chunk, box, cone, cyl, sphere, disc, streak, quad,
+  grassTuft, flower, tree, flame, smokePuff, decorItem, cloudCluster, sunBall, skyDome,
   tokenFor, mergeLayer, translateLayer, highlightRing, bboxOf, validIndices,
 };
 

@@ -49,6 +49,13 @@ const PLANTS = {
   tree:   { matureAt: 100, value: 5, baseRate: 0.85, waterNeed: 40 },
 };
 
+// Fire tuning: small, slow fires. Intensity capped at FIRE_MAX; a water
+// droplet hits with WATER_POWER center / WATER_SPLASH in radius 1, so one
+// droplet reliably kills a single-tile fire and two handle a small cluster.
+const FIRE_MAX = 60;
+const WATER_POWER = 75;
+const WATER_SPLASH = 35;
+
 const ENVS = {
   fishkill: {
     key: "fishkill", name: "fishkill", growthMult: 1.3,
@@ -84,13 +91,24 @@ function createGrid(envKey, rand) {
     for (let x = 0; x < SIZE; x++) row.push(createTile(env, rand));
     tiles.push(row);
   }
-  return {
+  const grid = {
     envKey, env,
     tiles,
     coldUntil: 0,      // timestamp ms — growth paused while Date.now() < coldUntil
     rainUntil: 0,
     extinguished: 0,   // fires put out on this grid
+    tickCount: 0,      // sim ticks elapsed (gates fire spread cadence)
+    windDir: rand() * Math.PI * 2, // direction the wind blows toward
+    windUntil: 0,      // strong wind while now < windUntil, else ambient breeze
+    decor: [],         // strewn ephemera: [{kind, x, y, rot, scale}] — visual only
   };
+  scatterDecor(grid, rand);
+  return grid;
+}
+
+// Effective wind level 0..1: gusts decay back to an ambient breeze.
+function windLevel(grid, now) {
+  return now < grid.windUntil ? 1 : 0.12;
 }
 
 function eachTile(grid, fn) {
@@ -115,6 +133,133 @@ function radiusTiles(x, y, r) {
   return out;
 }
 
+/* ---------------- natural dispersal ---------------- */
+// Two-phase: gather births from mature plants, then germinate the suitable
+// ones. Unsuitable landings vanish, like real life. Seeded-RNG deterministic.
+function disperseSeeds(grid, rand, now) {
+  if (now < grid.coldUntil) return; // growth paused
+  const windActive = now < grid.windUntil;
+  const births = [];
+  eachTile(grid, (t, x, y) => {
+    const p = t.plant;
+    if (!p) return;
+    const spec = PLANTS[p.kind];
+    if (p.growth < spec.matureAt) return;
+    if (p.kind === "grass") {
+      // rhizome runner: one random 8-neighbor, ~8%/tick, bonus on moist soil
+      let chance = 0.08;
+      if (t.water > 40) chance += 0.04;
+      if (rand() < chance) {
+        const ns = neighbors(x, y);
+        const [nx, ny] = ns[Math.floor(rand() * ns.length)];
+        births.push({ kind: "grass", x: nx, y: ny, growth: 8 });
+      }
+    } else if (p.kind === "flower") {
+      // seed kernel with distance falloff; wind extends range + biases downwind
+      if (rand() < 0.06) {
+        const dest = pickKernelLanding(x, y, rand, windActive ? 1 : 0, grid.windDir);
+        if (dest) births.push({ kind: "flower", x: dest[0], y: dest[1], growth: 8 });
+      }
+    } else if (p.kind === "tree") {
+      // rare long-distance seeding, only when fully mature
+      if (p.growth >= 100 && rand() < 0.015) {
+        const dest = pickRingLanding(x, y, 3, 5, rand);
+        if (dest) births.push({ kind: "tree", x: dest[0], y: dest[1], growth: 5 });
+      }
+    }
+  });
+  for (const b of births) {
+    const t = grid.tiles[b.y][b.x];
+    if (!t.plant && t.ground === "soil" && t.fire <= 0 && t.water > 25 && t.pollution < 60) {
+      t.plant = { kind: b.kind, growth: b.growth };
+    }
+  }
+}
+
+// Flower seed kernel: 60% ring 1, 30% ring 2, 10% rings 3-4 (Chebyshev).
+// windBonus extends the outer range by +1; with wind, landings bias downwind.
+function pickKernelLanding(x, y, rand, windBonus, windDir) {
+  const r = rand();
+  let rMin, rMax;
+  if (r < 0.6) { rMin = 1; rMax = 1; }
+  else if (r < 0.9) { rMin = 2; rMax = 2; }
+  else { rMin = 3; rMax = 4 + windBonus; }
+  const cands = [];
+  for (let dy = -rMax; dy <= rMax; dy++)
+    for (let dx = -rMax; dx <= rMax; dx++) {
+      const cheb = Math.max(Math.abs(dx), Math.abs(dy));
+      if (cheb < rMin || cheb > rMax) continue;
+      if (!inBounds(x + dx, y + dy)) continue;
+      cands.push([x + dx, y + dy, dx, dy]);
+    }
+  if (!cands.length) return null;
+  if (windBonus && rand() < 0.65) {
+    const wx = Math.cos(windDir), wy = Math.sin(windDir);
+    cands.sort((a, b) => (b[2] * wx + b[3] * wy) - (a[2] * wx + a[3] * wy));
+    const top = cands.slice(0, Math.max(1, Math.floor(cands.length * 0.25)));
+    return top[Math.floor(rand() * top.length)];
+  }
+  return cands[Math.floor(rand() * cands.length)];
+}
+
+// Uniform sample from the Chebyshev ring [rMin, rMax].
+function pickRingLanding(x, y, rMin, rMax, rand) {
+  const cands = [];
+  for (let dy = -rMax; dy <= rMax; dy++)
+    for (let dx = -rMax; dx <= rMax; dx++) {
+      const cheb = Math.max(Math.abs(dx), Math.abs(dy));
+      if (cheb < rMin || cheb > rMax) continue;
+      if (!inBounds(x + dx, y + dy)) continue;
+      cands.push([x + dx, y + dy]);
+    }
+  if (!cands.length) return null;
+  return cands[Math.floor(rand() * cands.length)];
+}
+
+/* ---------------- strewn ephemera ---------------- */
+// Decorative litter per environment, scattered per season. Purely visual:
+// never blocks placement or growth. Kind weights sum to 1 per environment.
+const DECOR_KINDS = {
+  fishkill: [
+    ["leaf", 0.34], ["twig", 0.22], ["stone", 0.18],
+    ["pinecone", 0.12], ["pebble", 0.10], ["feather", 0.04],
+  ],
+  brooklyn: [
+    ["paper", 0.30], ["pebble", 0.18], ["bottlecap", 0.18],
+    ["leaf", 0.16], ["twig", 0.10], ["button", 0.08],
+  ],
+};
+const DECOR_CAPS = { feather: 2, button: 3 }; // rare finds stay rare
+function pickDecorKind(kinds, counts, rand) {
+  for (let a = 0; a < 8; a++) {
+    const r = rand();
+    let acc = 0, kind = kinds[0][0];
+    for (const [k, w] of kinds) { acc += w; if (r <= acc) { kind = k; break; } }
+    if (DECOR_CAPS[kind] && (counts[kind] || 0) >= DECOR_CAPS[kind]) continue;
+    return kind;
+  }
+  return kinds[0][0];
+}
+function scatterDecor(grid, rand) {
+  const kinds = DECOR_KINDS[grid.envKey] || DECOR_KINDS.fishkill;
+  const counts = {};
+  const n = 15 + Math.floor(rand() * 11); // 15-25 items
+  const decor = [];
+  let guard = 0;
+  while (decor.length < n && guard++ < 600) {
+    const x = Math.floor(rand() * SIZE), y = Math.floor(rand() * SIZE);
+    const t = grid.tiles[y][x];
+    const p = t.plant;
+    if (p && p.growth >= PLANTS[p.kind].matureAt) continue; // never on mature plants
+    if (t.fire > 0) continue;
+    if (decor.some((d) => d.x === x && d.y === y)) continue; // one per tile
+    const kind = pickDecorKind(kinds, counts, rand);
+    counts[kind] = (counts[kind] || 0) + 1;
+    decor.push({ kind, x, y, rot: rand() * Math.PI * 2, scale: 0.8 + rand() * 0.4 });
+  }
+  grid.decor = decor;
+}
+
 /* ---------------- simulation tick ---------------- */
 function hasMatureFlowerNeighbor(grid, x, y) {
   return neighbors(x, y).some(([nx, ny]) => {
@@ -126,6 +271,7 @@ function hasMatureFlowerNeighbor(grid, x, y) {
 // Returns events: [{type:'ignite'|'rain'|'smog', x, y}] for sound/UI hooks.
 function tickGrid(grid, rand, now) {
   const events = [];
+  grid.tickCount++;
   const cold = now < grid.coldUntil;
   const raining = now < grid.rainUntil;
 
@@ -147,7 +293,7 @@ function tickGrid(grid, rand, now) {
       const x = Math.floor(rand() * SIZE), y = Math.floor(rand() * SIZE);
       const t = grid.tiles[y][x];
       if (t.fire <= 0 && t.plant && t.water < 18) {
-        t.fire = 55;
+        t.fire = 50;
         events.push({ type: "ignite", x, y });
         break;
       }
@@ -161,20 +307,20 @@ function tickGrid(grid, rand, now) {
       t.water = Math.min(100, t.water + 9);
       if (t.fire > 0) { t.fire = 0; grid.extinguished++; }
     }
-    // fire burns
+    // fire burns (small, slow)
     if (t.fire > 0) {
-      t.fire = Math.max(0, t.fire - 14 - t.water * 0.12);
+      t.fire = Math.max(0, t.fire - 12 - t.water * 0.12);
       if (t.fire > 25 && t.plant) {
         t.plant = null;
         t.ash = Math.min(1, t.ash + 0.5); // ash remembers: fertility after the burn
       }
       if (t.fire <= 0) { t.fire = 0; }
-      else {
-        // spread to adjacent dry tiles
+      else if (grid.tickCount % 2 === 0) {
+        // spread to adjacent dry fuel, every other tick
         for (const [nx, ny] of neighbors(x, y)) {
           const n = grid.tiles[ny][nx];
-          if (n.fire <= 0 && n.water < 22 && rand() < 0.16) {
-            n.fire = 45;
+          if (n.fire <= 0 && n.water < 25 && rand() < 0.08) {
+            n.fire = 40;
             events.push({ type: "ignite", x: nx, y: ny });
           }
         }
@@ -201,18 +347,8 @@ function tickGrid(grid, rand, now) {
     }
   });
 
-  // grass spreads after the growth pass (uses updated maturity)
-  eachTile(grid, (t, x, y) => {
-    const p = t.plant;
-    if (p && p.kind === "grass" && p.growth >= PLANTS.grass.matureAt && !cold) {
-      for (const [nx, ny] of neighbors(x, y)) {
-        const n = grid.tiles[ny][nx];
-        if (!n.plant && n.ground === "soil" && n.fire <= 0 && rand() < 0.05) {
-          n.plant = { kind: "grass", growth: 8 };
-        }
-      }
-    }
-  });
+  // natural dispersal pass (uses updated maturity)
+  disperseSeeds(grid, rand, now);
 
   return events;
 }
@@ -237,7 +373,22 @@ function applyItem(grid, x, y, itemKey, rand, now) {
     }
     case "water": {
       t.water = Math.min(100, t.water + 45);
-      if (t.fire > 0) { t.fire = 0; grid.extinguished++; return { ok: true, extinguished: true }; }
+      // a droplet hits hard at the center and splashes around it:
+      // one droplet kills any single-tile fire (intensity ≤ FIRE_MAX),
+      // two handle a small cluster.
+      let killed = 0;
+      const douse = (tile, power) => {
+        if (tile.fire > 0) {
+          tile.fire = Math.max(0, tile.fire - power);
+          if (tile.fire <= 0) killed++;
+        }
+      };
+      douse(t, WATER_POWER);
+      for (const [ax, ay] of radiusTiles(x, y, 1)) {
+        if (ax === x && ay === y) continue;
+        douse(grid.tiles[ay][ax], WATER_SPLASH);
+      }
+      if (killed > 0) { grid.extinguished += killed; return { ok: true, extinguished: true }; }
       return { ok: true };
     }
     case "soil": {
@@ -247,7 +398,7 @@ function applyItem(grid, x, y, itemKey, rand, now) {
     }
     case "fire": {
       if (t.fire > 0) return { ok: false, reason: "already burning" };
-      t.fire = 60;
+      t.fire = 55;
       return { ok: true };
     }
     case "oxygen": {
@@ -296,17 +447,9 @@ function applyItem(grid, x, y, itemKey, rand, now) {
     }
     case "wind_gust": {
       eachTile(grid, (ct) => { ct.water = Math.max(0, ct.water - 15); });
-      // seeds ride the wind to random tiles
-      eachTile(grid, (ct, cx, cy) => {
-        const p = ct.plant;
-        if (p && (p.kind === "grass" || p.kind === "flower") && p.growth >= PLANTS[p.kind].matureAt && rand() < 0.05) {
-          const tx = Math.floor(rand() * SIZE), ty = Math.floor(rand() * SIZE);
-          const dest = grid.tiles[ty][tx];
-          if (!dest.plant && dest.ground === "soil" && dest.fire <= 0) {
-            dest.plant = { kind: p.kind, growth: 8 };
-          }
-        }
-      });
+      // raise the wind: dispersal kernels bias downwind and sway picks up
+      grid.windUntil = now + 20000;
+      grid.windDir = rand() * Math.PI * 2;
       return { ok: true };
     }
     default:
@@ -952,6 +1095,8 @@ function drawGrids(now) {
     reducedMotion: Game.reducedMotion,
     seasonProgress: seasonProgress(now),
     rand: Game.rand,
+    // wind sway level for the vertex shader (gusts from wind_gust items decay)
+    wind: Math.max(windLevel(Game.grids.fishkill, now), windLevel(Game.grids.brooklyn, now)),
   });
 }
 
@@ -1011,8 +1156,11 @@ if (IS_BROWSER) boot();
 if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
   module.exports = {
     mulberry32, rngFromQuery, ITEMS, ITEM_KEYS, PLANTS, ENVS, SIZE, TICK_MS, SEASON_MS,
+    FIRE_MAX, WATER_POWER, WATER_SPLASH,
     createTile, createGrid, eachTile, inBounds, neighbors, radiusTiles,
     tickGrid, applyItem, scoreGrid, countPlants,
+    disperseSeeds, pickKernelLanding, pickRingLanding, windLevel,
+    scatterDecor, pickDecorKind, DECOR_KINDS, DECOR_CAPS,
     pickFallingItem, makeTrayItem, TRAY_CAP, HAZARD_TTL_MS,
     OPENING_HAIKU, CLOSING_HAIKU, fillHaiku, Sound, Game, landItem, resetSeason,
     renderGrid, renderSky, TILE_PX, GRID_PX, selectItem, placeAt,
