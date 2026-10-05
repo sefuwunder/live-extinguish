@@ -1,0 +1,135 @@
+/* LIVE/EXTINGUISH — zen earth palette. No corporate blue. */
+:root {
+  --paper: #f4efe4;
+  --paper-deep: #e9e1d0;
+  --ink: #3a342a;
+  --ink-soft: #6b6152;
+  --terracotta: #c26d45;
+  --terracotta-deep: #a0522d;
+  --sage: #8a9b6e;
+  --sage-deep: #5f7048;
+  --bark: #5d4a36;
+  --gold: #c9a227;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+  min-height: 100vh;
+  -webkit-tap-highlight-color: transparent;
+}
+.masthead { text-align: center; padding: 1.2rem 1rem 0.4rem; }
+.masthead h1 {
+  font-size: clamp(1.6rem, 5vw, 2.4rem);
+  letter-spacing: 0.35em;
+  margin: 0 0 0.15rem;
+  font-weight: 600;
+}
+.masthead h1 .slash { color: var(--terracotta); }
+.subtitle {
+  font-family: Georgia, "Times New Roman", serif;
+  font-style: italic;
+  color: var(--ink-soft);
+  margin: 0 0 0.6rem;
+}
+.topbar {
+  display: flex; gap: 0.6rem; align-items: center; justify-content: center;
+  font-size: 0.9rem; color: var(--ink-soft);
+}
+.season-label { font-family: Georgia, serif; font-style: italic; }
+.clock { font-variant-numeric: tabular-nums; background: var(--paper-deep); border-radius: 999px; padding: 0.15rem 0.7rem; }
+.ghost-btn {
+  background: none; border: 1px solid var(--paper-deep); border-radius: 999px;
+  font-size: 1rem; padding: 0.15rem 0.55rem; cursor: pointer; color: var(--ink-soft);
+}
+.ghost-btn[aria-pressed="true"] { opacity: 0.45; }
+.ghost-btn:active { transform: scale(0.94); }
+
+.fields {
+  display: flex; gap: 1.2rem; justify-content: center; align-items: flex-start;
+  padding: 0.8rem 1rem; flex-wrap: wrap;
+}
+.field {
+  background: #faf6ec; border: 1px solid var(--paper-deep); border-radius: 14px;
+  padding: 0.7rem; box-shadow: 0 2px 14px rgba(93, 74, 54, 0.08);
+  max-width: 420px; width: 100%;
+}
+.field header { text-align: center; margin-bottom: 0.4rem; }
+.field h2 { margin: 0; letter-spacing: 0.25em; font-size: 1.05rem; }
+.field-note { margin: 0.1rem 0; font-family: Georgia, serif; font-style: italic; font-size: 0.82rem; color: var(--ink-soft); }
+.score { margin: 0.25rem 0 0; font-size: 0.95rem; color: var(--sage-deep); font-weight: 600; }
+.score .detail { font-weight: 400; color: var(--ink-soft); font-size: 0.78rem; }
+.sky { width: 100%; height: auto; display: block; border-radius: 8px; }
+.grid {
+  width: 100%; height: auto; display: block; border-radius: 10px;
+  cursor: crosshair; touch-action: manipulation; margin-top: 0.35rem;
+  box-shadow: inset 0 0 0 1px rgba(93, 74, 54, 0.15);
+}
+.grid.flash-fail { animation: shake 0.25s; }
+@keyframes shake { 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
+
+.trays {
+  display: flex; gap: 1rem; justify-content: center; padding: 0.4rem 1rem 0.2rem; flex-wrap: wrap;
+}
+.tray {
+  background: #faf6ec; border: 1px solid var(--paper-deep); border-radius: 14px;
+  padding: 0.6rem 0.8rem; min-width: min(92vw, 420px); flex: 1 1 320px; max-width: 460px;
+}
+.tray h3 { margin: 0 0 0.45rem; font-size: 0.8rem; letter-spacing: 0.2em; color: var(--ink-soft); font-weight: 600; }
+.slots { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.4rem; }
+.slot {
+  aspect-ratio: 1; border-radius: 10px; background: var(--paper);
+  border: 1px dashed rgba(93, 74, 54, 0.25);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.5rem; cursor: pointer; position: relative;
+  transition: transform 0.12s, box-shadow 0.12s;
+  touch-action: manipulation; user-select: none;
+}
+.slot.filled { border-style: solid; background: #fffdf6; }
+.slot.filled:active { transform: scale(0.92); }
+.slot.selected {
+  outline: 3px solid var(--terracotta); outline-offset: 1px;
+  box-shadow: 0 0 12px rgba(194, 109, 69, 0.45);
+}
+.slot.hazard::after {
+  content: ""; position: absolute; inset: 2px; border-radius: 8px;
+  border: 2px solid rgba(194, 109, 69, 0.55); pointer-events: none;
+}
+.slot .fade { position: absolute; inset: 0; border-radius: 10px; background: rgba(244,239,228,0.55); }
+
+.hint, .extinguish { text-align: center; color: var(--ink-soft); font-family: Georgia, serif; font-style: italic; }
+.hint { margin: 0.7rem 1rem 0.2rem; font-size: 0.92rem; }
+.extinguish { margin: 0.2rem 0 2rem; font-size: 0.85rem; }
+.extinguish span { font-style: normal; font-weight: 700; color: var(--terracotta-deep); }
+
+.haiku-overlay {
+  position: fixed; inset: 0; background: rgba(58, 52, 42, 0.55);
+  display: flex; align-items: center; justify-content: center; z-index: 50; padding: 1rem;
+}
+.haiku-overlay[hidden] { display: none; }
+.haiku-card {
+  background: var(--paper); border-radius: 18px; padding: 2.2rem 2rem; max-width: 26rem;
+  text-align: center; box-shadow: 0 12px 48px rgba(0,0,0,0.25);
+  border-top: 4px solid var(--terracotta);
+}
+.haiku-text {
+  font-family: Georgia, serif; font-style: italic; font-size: 1.25rem; line-height: 2;
+  white-space: pre-line; margin: 0 0 1.4rem; color: var(--ink);
+}
+.haiku-text .result { font-style: normal; font-size: 0.95rem; color: var(--ink-soft); display: block; margin-top: 0.8rem; line-height: 1.6; }
+.begin-btn {
+  background: var(--terracotta); color: #fffdf6; border: none; border-radius: 999px;
+  font-size: 1rem; letter-spacing: 0.2em; padding: 0.7rem 2.4rem; cursor: pointer;
+}
+.begin-btn:active { transform: scale(0.96); }
+
+@media (max-width: 900px) {
+  .fields { flex-direction: column; align-items: center; }
+  .field { max-width: 94vw; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .grid.flash-fail { animation: none; }
+  .slot { transition: none; }
+}

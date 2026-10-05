@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LIVE/EXTINGUISH — a game as poetry</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="masthead">
+  <h1>LIVE<span class="slash">/</span>EXTINGUISH</h1>
+  <p class="subtitle">a game as poetry — fishkill · brooklyn</p>
+  <div class="topbar">
+    <span id="seasonLabel" class="season-label">season one</span>
+    <span id="clock" class="clock" aria-label="time left in season">5:00</span>
+    <button id="muteBtn" class="ghost-btn" aria-label="toggle sound">🔔</button>
+    <button id="motionBtn" class="ghost-btn" aria-label="toggle motion">🍃</button>
+  </div>
+</header>
+
+<main>
+  <section class="fields">
+    <article class="field" id="field-fishkill">
+      <header>
+        <h2>fishkill</h2>
+        <p class="field-note">rural · easy to grow things</p>
+        <p class="score" id="score-fishkill">0 live</p>
+      </header>
+      <canvas id="sky-fishkill" class="sky" width="384" height="64" aria-hidden="true"></canvas>
+      <canvas id="grid-fishkill" class="grid" width="384" height="384" role="img" aria-label="fishkill 16 by 16 garden grid"></canvas>
+    </article>
+    <article class="field" id="field-brooklyn">
+      <header>
+        <h2>brooklyn</h2>
+        <p class="field-note">urban · difficult to grow things</p>
+        <p class="score" id="score-brooklyn">0 live</p>
+      </header>
+      <canvas id="sky-brooklyn" class="sky" width="384" height="64" aria-hidden="true"></canvas>
+      <canvas id="grid-brooklyn" class="grid" width="384" height="384" role="img" aria-label="brooklyn 16 by 16 garden grid"></canvas>
+    </article>
+  </section>
+
+  <section class="trays" aria-label="staging trays">
+    <div class="tray" id="trayA">
+      <h3>tray one</h3>
+      <div class="slots" id="slotsA" role="listbox" aria-label="staging tray one"></div>
+    </div>
+    <div class="tray" id="trayB">
+      <h3>tray two</h3>
+      <div class="slots" id="slotsB" role="listbox" aria-label="staging tray two"></div>
+    </div>
+  </section>
+
+  <p class="hint">tap a gift from the sky, then tap the earth where it belongs.</p>
+  <p class="extinguish">🧯 <span id="extinguishCount">0</span> fires put out</p>
+</main>
+
+<div id="haiku" class="haiku-overlay" hidden>
+  <div class="haiku-card">
+    <p id="haikuText" class="haiku-text"></p>
+    <button id="haikuBtn" class="begin-btn">begin</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
