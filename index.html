@@ -19,25 +19,26 @@
 </header>
 
 <main>
-  <section class="fields">
+  <section class="fields" aria-label="field scores">
     <article class="field" id="field-fishkill">
-      <header>
-        <h2>fishkill</h2>
-        <p class="field-note">rural · easy to grow things</p>
-        <p class="score" id="score-fishkill">0 live</p>
-      </header>
-      <canvas id="sky-fishkill" class="sky" width="384" height="64" aria-hidden="true"></canvas>
-      <canvas id="grid-fishkill" class="grid" width="384" height="384" role="img" aria-label="fishkill 16 by 16 garden grid"></canvas>
+      <h2>fishkill</h2>
+      <p class="field-note">rural · easy to grow things</p>
+      <p class="score" id="score-fishkill">0 live</p>
     </article>
     <article class="field" id="field-brooklyn">
-      <header>
-        <h2>brooklyn</h2>
-        <p class="field-note">urban · difficult to grow things</p>
-        <p class="score" id="score-brooklyn">0 live</p>
-      </header>
-      <canvas id="sky-brooklyn" class="sky" width="384" height="64" aria-hidden="true"></canvas>
-      <canvas id="grid-brooklyn" class="grid" width="384" height="384" role="img" aria-label="brooklyn 16 by 16 garden grid"></canvas>
+      <h2>brooklyn</h2>
+      <p class="field-note">urban · difficult to grow things</p>
+      <p class="score" id="score-brooklyn">0 live</p>
     </article>
+  </section>
+
+  <section class="viewport">
+    <canvas id="scene" role="img" aria-label="3d view of the fishkill and brooklyn growing fields"></canvas>
+    <div id="glFallback" class="gl-fallback" hidden>
+      <p>the sky could not wake — this dream needs WebGL to grow.</p>
+      <button class="begin-btn" onclick="location.reload()">try again</button>
+    </div>
+    <p class="controls-hint">drag to look around · scroll or pinch to zoom · tap a gift, then tap the earth</p>
   </section>
 
   <section class="trays" aria-label="staging trays">
@@ -62,6 +63,8 @@
   </div>
 </div>
 
+<script src="models3d.js"></script>
+<script src="engine3d.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

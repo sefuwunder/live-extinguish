@@ -45,13 +45,21 @@ Each tile tracks ground (soil/concrete), water 0–100, pollution 0–100, a pla
 ## Architecture
 
 - `server.ts` — Bun.serve static file server, port 3022, zero dependencies.
-- `app.js` — the whole game. The simulation core (`createGrid`, `tickGrid`, `applyItem`, `scoreGrid`, …) is pure and DOM-free, exported for tests; UI/render/audio boot only when `document` exists.
-- `index.html` / `styles.css` — layout and the zen earth palette (paper, terracotta, sage, bark).
-- Canvas rendering: organic tiles, growth-staged plants, flickering fire, water sheen, smog haze, sky strips with falling gifts, drifting clouds, and a dawn→dusk sun arc across the season.
+- `app.js` — game state, simulation core, and UI. The sim (`createGrid`, `tickGrid`, `applyItem`, `scoreGrid`, …) is pure and DOM-free, exported for tests and **unchanged by the 3D conversion**; UI/render/audio boot only when `document` exists.
+- `models3d.js` — procedural 3D model builders (no assets): boxes, cones, cylinders, low-poly spheres, plus grass tufts, flowers, trees, flames, smoke, clouds, sun, rain streaks, sky-dome, and per-item falling tokens. A `Batcher` merges everything into opaque + transparent draw layers.
+- `engine3d.js` — native WebGL1 engine (raw WebGL, no Three.js): one shader (vertex colors + normals, single directional light + ambient, fog, per-vertex emissive), orbit/zoom camera, ray-plane tile picking, and the `Scene3D` orchestrator (static terrain layer, per-tick plant layer, per-frame FX layer).
+- `index.html` / `styles.css` — layout and the zen earth palette (paper, terracotta, sage, bark). One full-width WebGL canvas holds both plots; masthead, trays, haiku overlays, and counters are unchanged DOM.
+- The 2D canvas functions (`renderGrid`/`renderSky`) remain in app.js as the tested legacy renderer; the game itself renders in 3D.
 - WebAudio: soft pentatonic plucks on placement, a low drum on ignition, rain patter. 🔔 mutes. 🍃 toggles reduced motion (also honors `prefers-reduced-motion`).
 - `?seed=` query param gives a deterministic RNG for testing.
 - No build step, no database (in-memory; best scores in localStorage).
 
+## 3D controls
+
+- **Drag** to orbit (azimuth + clamped elevation) · **scroll / pinch** to zoom · **tap** a tray gift, then **tap the earth** to place it.
+- Hover highlights the tile under the cursor (mouse). A gentle idle sway moves the camera (off under reduced motion).
+- If WebGL is unavailable (or the context is lost), a quiet message appears with a reload button instead of the canvas.
+
 ## Tests
 
-`bun test` — 41 tests: 34 simulation unit tests (growth rules, fire spread/extinguish, grass spreading, smog stunting, seed-on-concrete, scoring math, tray caps, hazard expiry) + 7 stubbed-canvas render smoke tests.
+`bun test` — 66 tests: 41 original (34 simulation unit tests — growth rules, fire spread/extinguish, grass spreading, smog stunting, seed-on-concrete, scoring math, tray caps, hazard expiry — plus 7 legacy 2D render smoke tests, all unmodified and passing) + 25 new 3D engine tests (world↔tile mapping, picking round-trips, matrix math, camera clamps, model-builder geometry validity, batching, graceful WebGL fallback, scene orchestration on a stubbed renderer).

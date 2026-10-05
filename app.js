@@ -633,6 +633,7 @@ function resetSeason() {
     landItem(0, makeTrayItem(pickFallingItem(rand), Date.now()));
     landItem(1, makeTrayItem(pickFallingItem(rand), Date.now()));
   }
+  if (Game.scene3d) Game.scene3d.syncTerrain(Game.grids, rand, Date.now());
   renderTrays();
 }
 
@@ -664,7 +665,12 @@ function dropFromSky() {
     renderTrays();
     return;
   }
-  Game.falling.push({ itemKey, trayIdx, x: 40 + Game.rand() * 300, startT: now });
+  // 3D token descent target: a random plot + tile (purely presentational)
+  const plot = Game.rand() < 0.5 ? "fishkill" : "brooklyn";
+  Game.falling.push({
+    itemKey, trayIdx, x: 40 + Game.rand() * 300, startT: now,
+    plot, tx: Math.floor(Game.rand() * SIZE), ty: Math.floor(Game.rand() * SIZE),
+  });
   // land after the fall animation
   setTimeout(() => {
     const fi = Game.falling.findIndex((f) => f.itemKey === itemKey && f.trayIdx === trayIdx);
@@ -717,13 +723,8 @@ function consumeSelected() {
   return tray.splice(i, 1)[0];
 }
 
-function onGridClick(envKey, ev) {
+function placeAt(envKey, x, y) {
   if (!Game.running || !Game.selected) return;
-  const canvas = Game.els["grid" + envKey];
-  const rect = canvas.getBoundingClientRect();
-  const cx = (ev.clientX - rect.left) / rect.width * GRID_PX;
-  const cy = (ev.clientY - rect.top) / rect.height * GRID_PX;
-  const x = Math.floor(cx / TILE_PX), y = Math.floor(cy / TILE_PX);
   if (!inBounds(x, y)) return;
   const item = Game.trays[Game.selected.trayIdx].find((it) => it.id === Game.selected.itemId);
   if (!item) { Game.selected = null; renderTrays(); return; }
@@ -735,12 +736,82 @@ function onGridClick(envKey, ev) {
     if (res.extinguished) Sound.rainStop();
   } else {
     Sound.fail();
-    canvas.classList.remove("flash-fail");
-    void canvas.offsetWidth;
-    canvas.classList.add("flash-fail");
+    const canvas = Game.els.scene;
+    if (canvas) {
+      canvas.classList.remove("flash-fail");
+      void canvas.offsetWidth;
+      canvas.classList.add("flash-fail");
+    }
   }
   renderTrays();
   drawGrids(Date.now());
+}
+
+// ---- 3D pointer controls: drag = orbit, wheel/pinch = zoom, tap = pick/place ----
+function pickFromEvent(ev) {
+  const E3 = globalThis.Engine3D;
+  if (!E3 || !Game.scene3d) return null;
+  const canvas = Game.els.scene;
+  const rect = canvas.getBoundingClientRect();
+  const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
+  if (cx < 0 || cy < 0 || cx > rect.width || cy > rect.height) return null;
+  return E3.pickTile(cx, cy, rect.width, rect.height, Game.scene3d.camera, 0);
+}
+
+function wireScenePointer(canvas) {
+  const pointers = new Map();
+  let pdown = null;   // {x, y, moved}
+  let pinchDist = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) pdown = { x: e.clientX, y: e.clientY, moved: false };
+    pinchDist = 0;
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const prev = pointers.get(e.pointerId);
+    if (prev && Game.scene3d) {
+      const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pointers.size === 1) {
+        if (pdown && Math.hypot(e.clientX - pdown.x, e.clientY - pdown.y) > 8) pdown.moved = true;
+        if (pdown && pdown.moved) Game.scene3d.camera.orbit(dx, dy);
+      } else if (pointers.size === 2) {
+        const pts = [...pointers.values()];
+        const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        if (pinchDist > 0 && d > 0) Game.scene3d.camera.zoom(pinchDist / d);
+        pinchDist = d;
+        if (pdown) pdown.moved = true;
+      }
+    } else if (!prev && e.pointerType === "mouse" && Game.scene3d) {
+      // hover highlight (mouse only)
+      Game.scene3d.hoverTile = pickFromEvent(e);
+    }
+  });
+  const up = (e) => {
+    const wasTap = pointers.size === 1 && pdown && !pdown.moved;
+    pointers.delete(e.pointerId);
+    if (pointers.size === 0) {
+      if (wasTap) {
+        const hit = pickFromEvent(e);
+        if (hit) placeAt(hit.plot, hit.x, hit.y);
+      }
+      pdown = null;
+      pinchDist = 0;
+    }
+  };
+  canvas.addEventListener("pointerup", up);
+  canvas.addEventListener("pointercancel", (e) => {
+    pointers.delete(e.pointerId);
+    if (pointers.size === 0) { pdown = null; pinchDist = 0; }
+  });
+  canvas.addEventListener("pointerleave", () => {
+    if (Game.scene3d) Game.scene3d.hoverTile = null;
+  });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (Game.scene3d) Game.scene3d.camera.zoom(1 + Math.sign(e.deltaY) * 0.09);
+  }, { passive: false });
 }
 
 function fmtClock(ms) {
@@ -801,6 +872,40 @@ function showHaiku(text, resultLine, btnLabel) {
   Game.els.haiku.hidden = false;
 }
 
+function initSceneWithRetry(attemptsLeft) {
+  if (Game.scene3d) return;
+  const E3 = globalThis.Engine3D, M3 = globalThis.Models3D;
+  let renderer = null;
+  if (E3 && M3 && Game.els.scene) {
+    try { renderer = E3.createRenderer(Game.els.scene); } catch (err) { renderer = null; }
+  }
+  if (renderer) {
+    Game.scene3d = new E3.Scene3D(renderer, M3);
+    Game.scene3d.resize();
+    if (Game.grids.fishkill) Game.scene3d.syncTerrain(Game.grids, Game.rand, Date.now());
+    wireScenePointer(Game.els.scene);
+    window.addEventListener("resize", () => { if (Game.scene3d) Game.scene3d.resize(); });
+    Game.els.scene.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      Game.scene3d = null;
+      showGlFallback("the sky has gone dark — the dream needs its light back.");
+    });
+    return;
+  }
+  if (attemptsLeft > 0) {
+    setTimeout(() => initSceneWithRetry(attemptsLeft - 1), 1500);
+  } else {
+    showGlFallback("the sky could not wake — this dream needs WebGL to grow.");
+  }
+}
+
+function showGlFallback(msg) {
+  if (!Game.els.glFallback) return;
+  const p = Game.els.glFallback.querySelector("p");
+  if (p) p.textContent = msg;
+  Game.els.glFallback.hidden = false;
+}
+
 function hideHaiku() { Game.els.haiku.hidden = true; }
 
 function beginSeason() {
@@ -830,18 +935,24 @@ function gameTick() {
   for (let ti = 0; ti < 2; ti++)
     Game.trays[ti] = Game.trays[ti].filter((it) => !it.expiresAt || it.expiresAt > now);
   updateScores();
+  if (Game.scene3d) {
+    Game.scene3d.syncPlants(Game.grids, Game.rand, now);
+    Game.scene3d.refreshTerrainColors(Game.grids, now);
+  }
   drawGrids(now);
 }
 
 function drawGrids(now) {
-  const prog = seasonProgress(now);
-  const opts = { reducedMotion: Game.reducedMotion };
-  for (const key of ["fishkill", "brooklyn"]) {
-    const g = Game.els["grid" + key].getContext("2d");
-    renderGrid(g, Game.grids[key], now, opts);
-    const s = Game.els["sky" + key].getContext("2d");
-    renderSky(s, 384, 64, prog, Game.falling, Game.clouds[key], now, opts);
-  }
+  if (!Game.scene3d) return;
+  Game.scene3d.resize();
+  Game.scene3d.renderFrame({
+    grids: Game.grids,
+    falling: Game.falling,
+    now,
+    reducedMotion: Game.reducedMotion,
+    seasonProgress: seasonProgress(now),
+    rand: Game.rand,
+  });
 }
 
 function frame(nowMs) {
@@ -860,16 +971,16 @@ function boot() {
   const $ = (id) => document.getElementById(id);
   Game.els = {
     slotsA: $("slotsA"), slotsB: $("slotsB"),
-    gridfishkill: $("grid-fishkill"), gridbrooklyn: $("grid-brooklyn"),
-    skyfishkill: $("sky-fishkill"), skybrooklyn: $("sky-brooklyn"),
+    scene: $("scene"), glFallback: $("glFallback"),
     scorefishkill: $("score-fishkill"), scorebrooklyn: $("score-brooklyn"),
     extinguish: $("extinguishCount"), clock: $("clock"),
     seasonLabel: $("seasonLabel"), haiku: $("haiku"),
     haikuText: $("haikuText"), haikuBtn: $("haikuBtn"),
     muteBtn: $("muteBtn"), motionBtn: $("motionBtn"),
   };
-  Game.els.gridfishkill.addEventListener("click", (e) => onGridClick("fishkill", e));
-  Game.els.gridbrooklyn.addEventListener("click", (e) => onGridClick("brooklyn", e));
+  // 3D scene (graceful fallback when WebGL is unavailable; retry a few times
+  // because software GL can still be initializing on the first attempt)
+  initSceneWithRetry(3);
   Game.els.haikuBtn.addEventListener("click", beginSeason);
   Game.els.muteBtn.addEventListener("click", () => {
     Sound.muted = !Sound.muted;
@@ -890,6 +1001,8 @@ function boot() {
   setInterval(gameTick, TICK_MS);
   setInterval(dropFromSky, FALL_MS);
   requestAnimationFrame(frame);
+  // debug/testing hook (UI layer only)
+  globalThis.__leGame = Game;
 }
 
 if (IS_BROWSER) boot();
@@ -902,6 +1015,7 @@ if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
     tickGrid, applyItem, scoreGrid, countPlants,
     pickFallingItem, makeTrayItem, TRAY_CAP, HAZARD_TTL_MS,
     OPENING_HAIKU, CLOSING_HAIKU, fillHaiku, Sound, Game, landItem, resetSeason,
-    renderGrid, renderSky, TILE_PX, GRID_PX, selectItem, onGridClick,
+    renderGrid, renderSky, TILE_PX, GRID_PX, selectItem, placeAt,
+    // renderGrid/renderSky: legacy 2D renderer, kept for tests; the game uses WebGL.
   };
 }
