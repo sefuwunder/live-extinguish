@@ -629,6 +629,69 @@ function mergeLayer(batcher, finished) {
   }
 }
 
+// Organic canopy shade blob offsets for a tree at (x,y): mature (growth 100)
+// covers exactly 15 tiles — Manhattan diamond of 13 plus 2 seeded-
+// deterministic ring-3 tiles; young (60-99) is a plus-shape (5); below 60 none.
+// Mirrors the sim in app.js (shadeBlobFor) — keep the two in sync.
+function shadeBlobFor(growth, x, y) {
+  if (growth >= 100) {
+    const offs = [];
+    for (let dy = -2; dy <= 2; dy++)
+      for (let dx = -2; dx <= 2; dx++)
+        if (Math.abs(dx) + Math.abs(dy) <= 2) offs.push([dx, dy]);
+    const ring3 = [];
+    for (let dy = -3; dy <= 3; dy++)
+      for (let dx = -3; dx <= 3; dx++)
+        if (Math.max(Math.abs(dx), Math.abs(dy)) === 3) ring3.push([dx, dy]);
+    let a = (((x * 1009) ^ (y * 1013) ^ 0x9e37) >>> 0) || 1;
+    const crand = function () {
+      a |= 0; a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const i1 = Math.floor(crand() * ring3.length);
+    let i2 = Math.floor(crand() * (ring3.length - 1));
+    if (i2 >= i1) i2 += 1;
+    offs.push(ring3[i1], ring3[i2]);
+    return offs;
+  }
+  if (growth >= 60) return [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]];
+  return [];
+}
+
+// Bee: striped yellow-dark body, dark head, two translucent wing quads.
+// flapPhase drives the wing angle; bobbing is applied by the scene per frame.
+function bee(flapPhase) {
+  const b = new Batcher();
+  b.add(sphere(0.055, 6, [0.82, 0.62, 0.16]), mScale(1.5, 1, 1)); // body
+  b.add(sphere(0.032, 5, [0.16, 0.13, 0.10]), mTranslate(0.095, 0.012, 0)); // head
+  const flap = 0.5 + 0.5 * Math.sin(flapPhase);
+  const wcol = [0.94, 0.96, 0.98, 0.5];
+  for (const s of [-1, 1]) {
+    const wm = mMul(mTranslate(s * 0.05, 0.055, 0),
+      mMul(mRotX(s * (0.3 + flap * 0.9)), mScale(0.10, 1, 0.16)));
+    b.add(quad(wcol), wm);
+  }
+  return b.finish();
+}
+
+// Bird: small dark swift-like silhouette — slim body, tail, and two wings
+// swept back with a shallow dihedral. A per-frame roll wobble (applied by
+// the scene) sells the flap from side views.
+function birdShape() {
+  const b = new Batcher();
+  const c = [0.16, 0.14, 0.12];
+  b.add(box(0.36, 0.05, 0.08, c), mIdent()); // slim body
+  b.add(box(0.10, 0.03, 0.06, c), mTranslate(-0.21, 0.01, 0)); // tail
+  for (const s of [-1, 1]) {
+    const wm = mMul(mTranslate(0, 0.04, s * 0.24),
+      mMul(mRotX(-s * 0.30), mRotY(-s * 0.65))); // dihedral + swept back
+    b.add(box(0.15, 0.014, 0.5, c), wm);
+  }
+  return b.finish();
+}
+
 // Tile highlight ring: 4 thin boxes forming an outline, y≈0.16.
 function highlightRing(topY) {
   const b = new Batcher();
@@ -680,6 +743,7 @@ const Models3D = {
   mIdent, mTranslate, mScale, mRotY, mRotX, mMul, compose, xformPoint, xformNormal,
   Batcher, chunk, box, cone, cyl, sphere, disc, streak, quad, ring,
   grassTuft, flower, tree, flame, smokePuff, decorItem, cloudCluster, sunBall, skyDome,
+  bee, birdShape, shadeBlobFor,
   tokenFor, mergeLayer, translateLayer, highlightRing, bboxOf, validIndices,
 };
 

@@ -432,9 +432,10 @@ Scene3D.prototype.terrainColors = function (grids, cold) {
     } else if (tile.ground === "concrete") {
       c = M.mix3(M.PAL.concrete, M.PAL.concreteDeep, m.shade * 0.7);
     } else {
-      // soil: darken with moisture, vary with static shade
+      // soil: darken with moisture, vary with static shade, enrich with fertility
       const moist = Math.min(1, tile.water / 100);
-      c = M.mix3(M.PAL.soil, M.PAL.soilDeep, moist * 0.55 + m.shade * 0.25);
+      const fert = Math.min(1, (tile.fertility || 0) / 100);
+      c = M.mix3(M.PAL.soil, M.PAL.soilDeep, Math.min(1, moist * 0.55 + m.shade * 0.25 + fert * 0.30));
     }
     // canopy shade: subtle darkening under tree cover (sim canopyShade 0-3)
     const cs = tile.canopyShade || 0;
@@ -467,25 +468,27 @@ Scene3D.prototype.buildPlants = function (grids, rand, now) {
         // stage pop: brief overshoot when crossing a growth-stage boundary
         const ps = this.popScaleAt(key, x, y, now);
         if (ps !== 1) m = M.mMul(m, M.mScale(ps, ps, ps));
+        // wilt: the model droops (tilt + desaturate) while thirsty
+        if (tile.wilted) m = M.mMul(m, M.mRotX(0.28));
         // per-plant variation, deterministic per tile (no two plants identical)
         const jitter = M.plantJitter(tile.shade, x, y);
         if (p.kind === "grass") {
           const L = M.grassTuft(rand, g, jitter);
-          this._mergeAt(b, L, m, cold);
+          this._mergeAt(b, L, m, cold, tile.wilted);
         } else if (p.kind === "flower") {
           const colorIdx = (x * 7 + y * 13) % M.PAL.petals.length;
           const L = M.flower(rand, g, colorIdx, jitter);
-          this._mergeAt(b, L, m, cold);
+          this._mergeAt(b, L, m, cold, tile.wilted);
         } else {
           const L = M.tree(rand, g, jitter);
-          this._mergeAt(b, L, m, cold);
-          // canopy shade disc, sized to the sim shade radius (mirrors
-          // app.js shadeRadiusFor: 0 below 60, 1 at 60-99, 2 at 100).
+          this._mergeAt(b, L, m, cold, tile.wilted);
+          // canopy shade: one soft disc per blob tile, matching the sim's
+          // irregular 15-tile footprint (M.shadeBlobFor mirrors app.js).
           // Rebuilt per tick, so it grows with the tree and vanishes on burn.
-          const sr = g >= 100 ? 2 : g >= 60 ? 1 : 0;
-          if (sr > 0) {
-            b.add(M.disc(0.5 + sr * 0.85, 14, M.PAL.shadow.concat([0.30])),
-              M.mTranslate(w.x, topY + 0.012, w.z));
+          const blob = M.shadeBlobFor(g, x, y);
+          for (const [dx, dy] of blob) {
+            b.add(M.disc(0.72, 10, M.PAL.shadow.concat([0.26])),
+              M.mTranslate(w.x + dx, topY + 0.012, w.z + dy));
           }
         }
       }
@@ -501,8 +504,9 @@ Scene3D.prototype.buildPlants = function (grids, rand, now) {
   return b.finish();
 };
 
-Scene3D.prototype._mergeAt = function (batcher, finished, matrix, cold) {
-  // merge a finished layer, applying matrix + optional cold desaturation tint
+Scene3D.prototype._mergeAt = function (batcher, finished, matrix, cold, wilt) {
+  // merge a finished layer, applying matrix + optional cold desaturation /
+  // wilt droop tint
   const M = this.M;
   const layers = [finished.opaque, finished.trans];
   for (const layer of layers) {
@@ -518,6 +522,12 @@ Scene3D.prototype._mergeAt = function (batcher, finished, matrix, cold) {
     if (cold) {
       for (let i = 0; i < n; i++) {
         const c = M.mix3([cols[i*4], cols[i*4+1], cols[i*4+2]], M.PAL.cold, 0.35);
+        cols[i*4] = c[0]; cols[i*4+1] = c[1]; cols[i*4+2] = c[2];
+      }
+    }
+    if (wilt) {
+      for (let i = 0; i < n; i++) {
+        const c = M.mix3([cols[i*4], cols[i*4+1], cols[i*4+2]], [0.58, 0.55, 0.42], 0.45);
         cols[i*4] = c[0]; cols[i*4+1] = c[1]; cols[i*4+2] = c[2];
       }
     }
@@ -593,6 +603,51 @@ Scene3D.prototype.buildFx = function (state) {
     const tok = M.tokenFor(f.itemKey);
     const sc = 1 + Math.sin(pr * Math.PI) * 0.15;
     this._mergeAt(b, tok, M.compose(w.x, yy, w.z, sc, sc, sc, t * 1.5), false);
+  }
+  // fauna: bees bob over the blossoms, birds cross with seeds
+  // (BIRD_CROSS_MS mirrors app.js BIRD_MS — keep in sync)
+  const BIRD_CROSS_MS = 4000;
+  for (const key of this.plotKeys) {
+    const grid = grids[key];
+    if (grid.bees) {
+      for (const be of grid.bees) {
+        const w = tileToWorld(key, Math.max(0, Math.min(15, be.x)), Math.max(0, Math.min(15, be.y)));
+        if (!w) continue;
+        const bobY = 0.55 + Math.sin(t * 9 + be.phase) * 0.09;
+        const wob = reducedMotion ? 0 : Math.sin(t * 5 + be.phase * 2) * 0.06;
+        const flap = reducedMotion ? 0 : t * 30 + be.phase;
+        const BL = M.bee(flap);
+        const bm = M.mTranslate(w.x + wob, bobY, w.z);
+        this._mergeRaw(b, BL.opaque, bm);
+        this._mergeRaw(b, BL.trans, bm);
+      }
+    }
+    const bird = grid.bird;
+    if (bird && now < bird.until) {
+      const pr = Math.min(1, Math.max(0, (now - bird.t0) / BIRD_CROSS_MS));
+      const w0 = tileToWorld(key, 0, 0);
+      if (w0) {
+        // tile coords -> world: plot origin + tile + half-tile center
+        const bx = (w0.x - 0.5) + (bird.x0 + (bird.x1 - bird.x0) * pr) + 0.5;
+        const bz = (w0.z - 0.5) + (bird.y0 + Math.sin(pr * Math.PI * 3) * 0.8) + 0.5;
+        const by = 6 + Math.sin(pr * Math.PI) * 1.5;
+        const face = bird.x1 > bird.x0 ? 0 : Math.PI;
+        // gentle roll wobble: reads as wingbeats from side views
+        const bank = reducedMotion ? 0 : Math.sin(t * 9 + 1.7) * 0.35;
+        this._mergeRaw(b, M.birdShape().opaque,
+          M.mMul(M.mTranslate(bx, by, bz), M.mMul(M.mRotY(face), M.mRotX(bank))));
+      }
+    }
+    if (grid.birdSpecks) {
+      for (const s of grid.birdSpecks) {
+        const w = tileToWorld(key, s.x, s.y);
+        if (!w) continue;
+        const ti = (key === "fishkill" ? 0 : SIZE16 * SIZE16) + s.y * SIZE16 + s.x;
+        const topY = this.terrain ? this.terrain.heights[ti] : 0;
+        const fade = Math.max(0, Math.min(1, (s.until - now) / 2500));
+        b.add(M.disc(0.09, 8, [1, 1, 1, 0.85 * fade]), M.mTranslate(w.x, topY + 0.03, w.z));
+      }
+    }
   }
   // hover highlight
   if (this.hoverTile) {

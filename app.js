@@ -76,11 +76,15 @@ function createTile(env, rand) {
     ground: concrete ? "concrete" : "soil",
     water: concrete ? 5 + rand() * 10 : 30 + rand() * 30,
     pollution: env.pollMin + rand() * (env.pollMax - env.pollMin),
+    // soil fertility 0-100: rich loam in fishkill, thin urban soil in brooklyn,
+    // near-sterile under concrete. Drives the succession arc.
+    fertility: concrete ? 10 : (env.key === "fishkill" ? 60 + rand() * 20 : 20 + rand() * 20),
     plant: null,       // { kind, growth }
     fire: 0,           // 0-100 intensity
     ash: 0,            // fertility memory after fire (0-1)
     shade: rand(),     // static organic variation for rendering
     canopyShade: 0,    // tree-canopy shade count 0-3, recomputed each tick
+    wilted: false,     // drought droop: growth paused, recovers when watered
   };
 }
 
@@ -102,6 +106,9 @@ function createGrid(envKey, rand) {
     windDir: rand() * Math.PI * 2, // direction the wind blows toward
     windUntil: 0,      // strong wind while now < windUntil, else ambient breeze
     decor: [],         // strewn ephemera: [{kind, x, y, rot, scale}] — visual only
+    bees: [],          // [{x, y, phase}] tile-float coords; pollinators
+    bird: null,        // {t0, until, x0, y0, x1, drops:[{frac, x, y, done}]} | null
+    birdSpecks: [],    // [{x, y, until}] white drop markers, visual only
   };
   scatterDecor(grid, rand);
   return grid;
@@ -135,23 +142,50 @@ function radiusTiles(x, y, r) {
 }
 
 /* ---------------- tree canopy shade (sim) ---------------- */
-// Chebyshev shade radius cast by a tree: 0 below 60 growth, 1 at 60-99,
-// 2 at full maturity. Only trees cast shade.
-function shadeRadiusFor(kind, growth) {
-  if (kind !== "tree") return 0;
-  if (growth >= 100) return 2;
-  if (growth >= 60) return 1;
-  return 0;
+// Deterministic per-tile RNG (for the irregular canopy blob below).
+function coordRand(x, y) {
+  let a = (((x * 1009) ^ (y * 1013) ^ 0x9e37) >>> 0) || 1;
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Organic canopy shade blob as tile offsets from the trunk.
+// Mature tree (growth 100): exactly 15 tiles — the Manhattan diamond of 13
+// (|dx|+|dy| <= 2) plus 2 seeded-deterministic ring-3 tiles, so every canopy
+// is slightly irregular. Young tree (60-99): plus-shape (5). Below 60: none.
+// Only trees cast shade. Mirrors Models3D.shadeBlobFor — keep in sync.
+function shadeBlobFor(growth, x, y) {
+  if (growth >= 100) {
+    const offs = [];
+    for (let dy = -2; dy <= 2; dy++)
+      for (let dx = -2; dx <= 2; dx++)
+        if (Math.abs(dx) + Math.abs(dy) <= 2) offs.push([dx, dy]);
+    const ring3 = [];
+    for (let dy = -3; dy <= 3; dy++)
+      for (let dx = -3; dx <= 3; dx++)
+        if (Math.max(Math.abs(dx), Math.abs(dy)) === 3) ring3.push([dx, dy]);
+    const r = coordRand(x, y);
+    const i1 = Math.floor(r() * ring3.length);
+    let i2 = Math.floor(r() * (ring3.length - 1));
+    if (i2 >= i1) i2 += 1;
+    offs.push(ring3[i1], ring3[i2]);
+    return offs; // 13 + 2 = 15
+  }
+  if (growth >= 60) return [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]];
+  return [];
 }
 // Recompute per-tile canopyShade counts (capped at 3). Cheap: 512 tiles.
 function computeShadeMap(grid) {
   eachTile(grid, (t) => { t.canopyShade = 0; });
   eachTile(grid, (t, x, y) => {
     const p = t.plant;
-    if (!p) return;
-    const r = shadeRadiusFor(p.kind, p.growth);
-    if (r <= 0) return;
-    for (const [sx, sy] of radiusTiles(x, y, r)) {
+    if (!p || p.kind !== "tree") return;
+    for (const [dx, dy] of shadeBlobFor(p.growth, x, y)) {
+      const sx = x + dx, sy = y + dy;
+      if (!inBounds(sx, sy)) continue;
       const st = grid.tiles[sy][sx];
       st.canopyShade = Math.min(3, st.canopyShade + 1);
     }
@@ -195,6 +229,18 @@ function disperseSeeds(grid, rand, now, events) {
   });
   for (const b of births) {
     const t = grid.tiles[b.y][b.x];
+    // succession gates: flowers need decent soil, trees need rich soil.
+    // grass is the pioneer — it germinates anywhere and terraforms.
+    const fertGate = b.kind === "flower" ? t.fertility > 30
+      : b.kind === "tree" ? t.fertility > 50 : true;
+    if (!fertGate) continue; // too poor: the seed waits for a richer season
+    // crowding: dense mature neighborhoods halve germination (density dependence)
+    let matureN = 0;
+    for (const [nx, ny] of neighbors(b.x, b.y)) {
+      const p = grid.tiles[ny][nx].plant;
+      if (p && p.growth >= PLANTS[p.kind].matureAt) matureN++;
+    }
+    if (matureN >= 4 && rand() < 0.5) continue;
     if (!t.plant && t.ground === "soil" && t.fire <= 0 && t.water > 25 && t.pollution < 60) {
       t.plant = { kind: b.kind, growth: b.growth };
       if (events) events.push({ type: "germinate", x: b.x, y: b.y, kind: b.kind });
@@ -318,6 +364,113 @@ function hasMatureFlowerNeighbor(grid, x, y) {
   });
 }
 
+/* ---------------- fauna: bees ---------------- */
+// Bees gather where flowers bloom: ≥3 mature flowers within radius 3 of a
+// tile may attract a bee (cap 6 per plot). They wander toward blossoms and
+// boost nearby growth ×1.2; they leave when the patch is gone.
+const BEE_MAX = 6;
+function countMatureFlowersNear(grid, x, y, r) {
+  let n = 0;
+  for (const [nx, ny] of radiusTiles(x, y, r)) {
+    const p = grid.tiles[ny][nx].plant;
+    if (p && p.kind === "flower" && p.growth >= PLANTS.flower.matureAt) n++;
+  }
+  return n;
+}
+function nearestMatureFlower(grid, x, y, r) {
+  let best = null, bestD = Infinity;
+  for (const [nx, ny] of radiusTiles(Math.round(x), Math.round(y), r)) {
+    const p = grid.tiles[ny][nx].plant;
+    if (p && p.kind === "flower" && p.growth >= PLANTS.flower.matureAt) {
+      const d = Math.hypot(nx - x, ny - y);
+      if (d < bestD) { bestD = d; best = [nx, ny]; }
+    }
+  }
+  return best;
+}
+function beeBoostAt(grid, x, y) {
+  // ×1.2 growth for plants within Chebyshev 2 of any bee
+  for (const b of grid.bees) {
+    if (Math.max(Math.abs(b.x - x), Math.abs(b.y - y)) <= 2) return 1.2;
+  }
+  return 1;
+}
+function updateBees(grid, rand) {
+  // wander toward blossoms; leave when the patch is gone
+  for (let i = grid.bees.length - 1; i >= 0; i--) {
+    const bee = grid.bees[i];
+    const target = nearestMatureFlower(grid, bee.x, bee.y, 6);
+    if (!target) { grid.bees.splice(i, 1); continue; } // patch gone
+    const dx = target[0] - bee.x, dy = target[1] - bee.y;
+    const d = Math.hypot(dx, dy) || 1;
+    bee.x = Math.min(SIZE - 1, Math.max(0, bee.x + (dx / d) * 0.8 + (rand() - 0.5) * 0.6));
+    bee.y = Math.min(SIZE - 1, Math.max(0, bee.y + (dy / d) * 0.8 + (rand() - 0.5) * 0.6));
+  }
+  // newcomers arrive where flowers cluster
+  if (grid.bees.length < BEE_MAX && rand() < 0.25) {
+    const x = Math.floor(rand() * SIZE), y = Math.floor(rand() * SIZE);
+    if (countMatureFlowersNear(grid, x, y, 3) >= 3) {
+      grid.bees.push({ x, y, phase: rand() * Math.PI * 2 });
+    }
+  }
+}
+
+/* ---------------- fauna: birds ---------------- */
+// Every 45-90s a bird glides across the plot and drops 1-2 tree seeds under
+// its path — the main long-distance dispersal event. A white speck marks
+// each drop briefly.
+const BIRD_MS = 4000;
+function updateBird(grid, rand, now, events) {
+  // fade old drop specks
+  if (grid.birdSpecks.length)
+    grid.birdSpecks = grid.birdSpecks.filter((s) => s.until > now);
+  const bird = grid.bird;
+  if (bird) {
+    const pr = (now - bird.t0) / BIRD_MS;
+    for (const d of bird.drops) {
+      if (!d.done && pr >= d.frac) {
+        d.done = true;
+        const t = grid.tiles[d.y] && grid.tiles[d.y][d.x];
+        if (t && !t.plant && t.ground === "soil" && t.fire <= 0 &&
+            t.water > 25 && t.pollution < 60 && t.fertility > 50) {
+          t.plant = { kind: "tree", growth: 5 };
+          if (events) events.push({ type: "germinate", x: d.x, y: d.y, kind: "tree" });
+        }
+        grid.birdSpecks.push({ x: d.x, y: d.y, until: now + 2500 });
+      }
+    }
+    if (now >= bird.until) grid.bird = null;
+    return;
+  }
+  // ~1/84 per tick ≈ one visit every 45-90s (tick = 800ms)
+  if (rand() >= 0.012) return;
+  const y0 = 2 + Math.floor(rand() * (SIZE - 4));
+  const leftToRight = rand() < 0.5;
+  const nDrops = 1 + (rand() < 0.5 ? 1 : 0);
+  const drops = [];
+  for (let i = 0; i < nDrops; i++) {
+    drops.push({
+      frac: 0.25 + rand() * 0.5,
+      x: Math.max(0, Math.min(SIZE - 1, Math.floor(rand() * SIZE))),
+      y: Math.max(0, Math.min(SIZE - 1, y0 + Math.floor(rand() * 3) - 1)),
+      done: false,
+    });
+  }
+  grid.bird = {
+    t0: now, until: now + BIRD_MS,
+    x0: leftToRight ? -2 : SIZE + 1, x1: leftToRight ? SIZE + 1 : -2,
+    y0, drops,
+  };
+}
+function birdPos(bird, now) {
+  const pr = Math.min(1, Math.max(0, (now - bird.t0) / BIRD_MS));
+  return {
+    x: bird.x0 + (bird.x1 - bird.x0) * pr,
+    y: bird.y0 + Math.sin(pr * Math.PI * 3) * 0.8, // gentle wobble
+    dir: bird.x1 > bird.x0 ? 1 : -1,
+  };
+}
+
 // Returns events: [{type:'ignite'|'rain'|'smog', x, y}] for sound/UI hooks.
 function tickGrid(grid, rand, now) {
   const events = [];
@@ -354,6 +507,9 @@ function tickGrid(grid, rand, now) {
   // tree canopy shade: recompute before the tile loop so evaporation and
   // growth see this tick's shade map
   computeShadeMap(grid);
+  // fauna: bees wander toward blossoms; a bird may cross with tree seeds
+  updateBees(grid, rand);
+  updateBird(grid, rand, now, events);
   eachTile(grid, (t, x, y) => {
     // rain: soak + extinguish
     if (isRaining) {
@@ -366,6 +522,7 @@ function tickGrid(grid, rand, now) {
       if (t.fire > 25 && t.plant) {
         t.plant = null;
         t.ash = Math.min(1, t.ash + 0.5); // ash remembers: fertility after the burn
+        t.fertility = Math.min(100, t.fertility + 15); // death composts
       }
       if (t.fire <= 0) { t.fire = 0; }
       else if (grid.tickCount % 2 === 0) {
@@ -385,19 +542,34 @@ function tickGrid(grid, rand, now) {
     // pollution drifts slowly down
     t.pollution = Math.max(0, t.pollution - 0.25);
 
-    // plant growth
+    // plants drink, grow, and feed the soil
     const p = t.plant;
+    if (p) {
+      // water consumption per tick: grass 0.3 / flower 0.5 / tree 0.8 (× growth/100)
+      const drink = { grass: 0.3, flower: 0.5, tree: 0.8 }[p.kind] * (p.growth / 100);
+      t.water = Math.max(0, t.water - drink);
+    }
+    // wilt: below 15 water growth pauses and the model droops; watering revives
+    t.wilted = !!(p && t.water < 15);
     if (p && !cold) {
       const spec = PLANTS[p.kind];
       const waterOk = t.water > 30;
       const airOk = t.pollution < 60;
-      if (waterOk && airOk && t.fire <= 0) {
+      if (waterOk && airOk && t.fire <= 0 && !t.wilted) {
         let rate = spec.baseRate * grid.env.growthMult;
         rate *= 1 + t.ash * 0.6;                       // ash-fed soil
         if (hasMatureFlowerNeighbor(grid, x, y)) rate *= 1.15; // pollinators
         if (t.water < spec.waterNeed + 10) rate *= 0.6; // thirsty
         if (p.kind !== "tree" && csh > 0) rate *= (1 - 0.12 * csh); // shade slows understory
-        p.growth = Math.min(100, p.growth + rate);
+        rate *= beeBoostAt(grid, x, y);                // bees: ×1.2 near a bee
+        const gain = Math.min(rate, 100 - p.growth);
+        p.growth += gain;
+        // growing plants consume fertility: 0.1 × growth increment
+        t.fertility = Math.max(0, t.fertility - 0.1 * gain);
+        // mature grass builds soil (worm casts), up to the cap
+        if (p.kind === "grass" && p.growth >= spec.matureAt) {
+          t.fertility = Math.min(100, t.fertility + 0.5);
+        }
       }
     }
   });
@@ -423,6 +595,10 @@ function applyItem(grid, x, y, itemKey, rand, now) {
       if (t.ground !== "soil") return { ok: false, reason: "needs soil" };
       if (t.plant) return { ok: false, reason: "occupied" };
       if (t.fire > 0) return { ok: false, reason: "burning" };
+      // succession gates: flowers need decent soil, trees need rich soil.
+      // grass pioneers anywhere and terraforms over the season.
+      const needFert = kind === "flower" ? 30 : kind === "tree" ? 50 : 0;
+      if (t.fertility <= needFert) return { ok: false, reason: "soil too poor" };
       t.plant = { kind, growth: 5 };
       return { ok: true };
     }
@@ -449,6 +625,7 @@ function applyItem(grid, x, y, itemKey, rand, now) {
     case "soil": {
       t.ground = "soil"; // concrete → plantable, permanently
       if (t.water < 25) t.water = 25;
+      t.fertility = Math.max(t.fertility, 35); // fresh-laid soil starts workable
       return { ok: true };
     }
     case "fire": {
@@ -471,11 +648,14 @@ function applyItem(grid, x, y, itemKey, rand, now) {
       const p = t.plant;
       if (p && (p.kind === "flower" || p.growth < 40)) {
         p.growth -= 28;
-        if (p.growth <= 0) t.plant = null;
+        if (p.growth <= 0) {
+          t.plant = null;
+          t.fertility = Math.min(100, t.fertility + 15); // death composts
+        }
       }
       for (const [nx, ny] of neighbors(x, y)) {
         const n = grid.tiles[ny][nx];
-        if (!n.plant && n.ground === "soil" && n.fire <= 0 && rand() < 0.22) {
+        if (!n.plant && n.ground === "soil" && n.fire <= 0 && n.fertility > 30 && rand() < 0.22) {
           n.plant = { kind: "flower", growth: 8 };
         }
       }
@@ -495,7 +675,10 @@ function applyItem(grid, x, y, itemKey, rand, now) {
         const p = ct.plant;
         if (p && p.kind === "flower" && p.growth < 50) {
           p.growth -= 15;
-          if (p.growth <= 0) ct.plant = null;
+          if (p.growth <= 0) {
+            ct.plant = null;
+            ct.fertility = Math.min(100, ct.fertility + 15); // death composts
+          }
         }
       });
       return { ok: true };
@@ -1219,7 +1402,9 @@ if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
     createTile, createGrid, eachTile, inBounds, neighbors, radiusTiles,
     tickGrid, applyItem, scoreGrid, countPlants,
     disperseSeeds, pickKernelLanding, pickRingLanding, windLevel,
-    shadeRadiusFor, computeShadeMap,
+    shadeBlobFor, coordRand, computeShadeMap,
+    updateBees, updateBird, birdPos, beeBoostAt, countMatureFlowersNear,
+    BEE_MAX, BIRD_MS,
     scatterDecor, pickDecorKind, DECOR_KINDS, DECOR_CAPS,
     pickFallingItem, makeTrayItem, TRAY_CAP, HAZARD_TTL_MS,
     OPENING_HAIKU, CLOSING_HAIKU, fillHaiku, Sound, Game, landItem, resetSeason,

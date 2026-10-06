@@ -33,13 +33,18 @@ Trays hold 12 each — a full tray lets new gifts fade away (impermanence).
 
 ## The simulation (tick ≈ 800ms)
 
-Each tile tracks ground (soil/concrete), water 0–100, pollution 0–100, a plant (kind + growth 0–100), fire intensity, and ash memory.
+Each tile tracks ground (soil/concrete), water 0–100, pollution 0–100, **soil fertility 0–100**, a plant (kind + growth 0–100), fire intensity, and ash memory.
 
 - Plants grow when water > 30, pollution < 60, and no cold snap. Fishkill ×1.3, Brooklyn ×0.7.
 - Water evaporates; rain soaks and kills all fire; heat ignites dry planted tiles.
 - Fire spreads to dry neighbors, destroys plants, leaves **ash** that feeds what comes next. Slash-and-burn has a purpose.
 - Grass spreads to adjacent empty soil at maturity. Trees are slow and precious.
-- **Tree shade:** mature trees shade the ground — growth ≥60 shades a Chebyshev radius of 1, growth 100 shades radius 2. Shaded soil evaporates slower (×(1 − 0.25 × shade)) and grass/flowers grow slower under canopy (×(1 − 0.12 × shade)); trees don't mind the shade.
+- **Tree shade:** each tree casts an organic canopy blob — 15 tiles at growth 100 (a Manhattan diamond of 13 plus 2 seeded-irregular ring-3 tiles, unique per tree), a 5-tile plus at 60–99, none below. Shaded soil evaporates slower (×(1 − 0.25 × shade)) and grass/flowers grow slower under canopy (×(1 − 0.12 × shade), capped at 3 overlapping canopies); trees don't mind the shade.
+- **Soil fertility:** rich loam in Fishkill (60–80), thin urban soil in Brooklyn (20–40), near-sterile under concrete (10). Mature grass builds it (+0.5/tick, worm casts); growing plants drink from it (0.1 × growth gained); death by fire, cold, or flies composts it (+15). Flowers only germinate above 30, trees above 50 — grass pioneers, flowers follow, trees crown the arc. Brooklyn terraforms over a season.
+- **Thirst:** plants drink each tick (grass 0.3, flower 0.5, tree 0.8 × growth/100). Below 15 water a plant **wilts** — growth pauses, the model droops and desaturates — and recovers when watered. Zen, never punishing.
+- **Crowding:** germination is halved when 4+ neighboring tiles hold mature plants.
+- **Bees:** where 3+ mature flowers bloom within radius 3, bees arrive (max 6 per plot). They wander toward blossoms, boost nearby growth ×1.2, and leave when the patch is gone.
+- **Birds:** every 45–90s a bird glides across a plot and drops 1–2 tree seeds under its path (marked briefly by a white speck) — long-distance dispersal, the main way trees travel now.
 - **Growth is an event:** seeds burst into 6–10 rising green motes plus a soft ring pulse; crossing a growth stage pops the plant to 1.25× scale, settling with an easeOutBack bounce over 0.5s. Young growth is pale yellow-green, maturity a deep saturated green.
 - **LIVE score:** grass ×1 + flowers ×3 + trees ×5 per grid (half value while young).
 - **EXTINGUISH:** fires put out, counted with quiet pride.

@@ -2,7 +2,7 @@
 // tree shade (sim + visual), germination bursts, stage pops, built-environment ephemera.
 const {
   mulberry32, createGrid, tickGrid, applyItem, PLANTS, SIZE,
-  shadeRadiusFor, computeShadeMap, scatterDecor, DECOR_KINDS,
+  shadeBlobFor, computeShadeMap, scatterDecor, DECOR_KINDS,
 } = require("../app.js");
 const M = require("../models3d.js");
 const E = require("../engine3d.js");
@@ -20,34 +20,64 @@ function soilGrid(envKey = "fishkill", seed = 7, water = 80) {
 }
 function cheb(x1, y1, x2, y2) { return Math.max(Math.abs(x1 - x2), Math.abs(y1 - y2)); }
 
-/* ---------------- 1. shade radius ---------------- */
+/* ---------------- 1. shade blob ---------------- */
 
-test("shadeRadiusFor: 0 below 60, 1 at 60-99, 2 at 100; only trees", () => {
-  expect(shadeRadiusFor("tree", 0)).toBe(0);
-  expect(shadeRadiusFor("tree", 59)).toBe(0);
-  expect(shadeRadiusFor("tree", 60)).toBe(1);
-  expect(shadeRadiusFor("tree", 99)).toBe(1);
-  expect(shadeRadiusFor("tree", 100)).toBe(2);
-  expect(shadeRadiusFor("grass", 100)).toBe(0);
-  expect(shadeRadiusFor("flower", 100)).toBe(0);
+test("shadeBlobFor: 15 tiles at 100, 5 at 60-99, none below; only trees", () => {
+  expect(shadeBlobFor(0, 8, 8)).toEqual([]);
+  expect(shadeBlobFor(59, 8, 8)).toEqual([]);
+  expect(shadeBlobFor(60, 8, 8)).toEqual([[0,0],[1,0],[-1,0],[0,1],[0,-1]]);
+  expect(shadeBlobFor(99, 8, 8).length).toBe(5);
+  expect(shadeBlobFor(100, 8, 8).length).toBe(15);
 });
 
-test("shade map marks covered tiles, not distant ones", () => {
+test("mature blob = manhattan diamond of 13 + 2 seeded ring-3 tiles", () => {
+  const blob = shadeBlobFor(100, 8, 8);
+  const diamond = blob.filter(([dx, dy]) => Math.abs(dx) + Math.abs(dy) <= 2);
+  const ring3 = blob.filter(([dx, dy]) => Math.max(Math.abs(dx), Math.abs(dy)) === 3);
+  expect(diamond.length).toBe(13);
+  expect(ring3.length).toBe(2);
+  expect(ring3).toEqual([[2, 3], [3, -2]]); // seeded-deterministic for (8,8)
+});
+
+test("blob is deterministic per tile, and varies between tiles", () => {
+  expect(shadeBlobFor(100, 5, 5)).toEqual(shadeBlobFor(100, 5, 5));
+  const a = JSON.stringify(shadeBlobFor(100, 5, 5));
+  const b = JSON.stringify(shadeBlobFor(100, 8, 8));
+  expect(a).not.toBe(b); // irregular canopies differ
+  // app.js and models3d.js must agree (sim ↔ render)
+  expect(M.shadeBlobFor(100, 5, 5)).toEqual(shadeBlobFor(100, 5, 5));
+  expect(M.shadeBlobFor(100, 8, 8)).toEqual(shadeBlobFor(100, 8, 8));
+});
+
+test("shade map marks the blob, not distant tiles", () => {
   const g = soilGrid();
   g.tiles[8][8].plant = { kind: "tree", growth: 100 };
   computeShadeMap(g);
   expect(g.tiles[8][8].canopyShade).toBeGreaterThan(0);   // own tile
-  expect(g.tiles[10][10].canopyShade).toBeGreaterThan(0); // cheb 2
-  expect(g.tiles[11][8].canopyShade).toBe(0);             // cheb 3
-  expect(g.tiles[8][11].canopyShade).toBe(0);
+  expect(g.tiles[9][9].canopyShade).toBeGreaterThan(0);   // manhattan 2 (diamond)
+  expect(g.tiles[11][10].canopyShade).toBeGreaterThan(0); // ring-3 pick [2,3]
+  expect(g.tiles[6][11].canopyShade).toBeGreaterThan(0);  // ring-3 pick [3,-2]
+  expect(g.tiles[10][10].canopyShade).toBe(0);            // manhattan 4, outside blob
+  expect(g.tiles[11][8].canopyShade).toBe(0);             // ring 3, not picked
+  // exactly 15 shaded tiles (tree is centered, no edge clipping)
+  let n = 0;
+  for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++)
+    if (g.tiles[y][x].canopyShade > 0) n++;
+  expect(n).toBe(15);
 });
 
-test("young tree (growth 70) shades radius 1 only", () => {
+test("young tree (growth 70) shades a plus-shape of 5", () => {
   const g = soilGrid();
   g.tiles[8][8].plant = { kind: "tree", growth: 70 };
   computeShadeMap(g);
-  expect(g.tiles[9][9].canopyShade).toBeGreaterThan(0); // cheb 1
-  expect(g.tiles[10][10].canopyShade).toBe(0);          // cheb 2
+  expect(g.tiles[9][8].canopyShade).toBeGreaterThan(0); // orthogonal
+  expect(g.tiles[8][9].canopyShade).toBeGreaterThan(0);
+  expect(g.tiles[9][9].canopyShade).toBe(0);            // diagonal: no shade
+  expect(g.tiles[10][8].canopyShade).toBe(0);          // two away: no shade
+  let n = 0;
+  for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++)
+    if (g.tiles[y][x].canopyShade > 0) n++;
+  expect(n).toBe(5);
 });
 
 test("sapling casts no shade; overlapping canopies cap at 3", () => {
@@ -78,34 +108,34 @@ test("shaded soil evaporates slower", () => {
   const a = mk(true), b = mk(false);
   tickGrid(a, fixedRand(1), 1e9);
   tickGrid(b, fixedRand(1), 1e9);
-  // tile (7,7): cheb 2 from the tree → shaded in a, open in b
-  expect(a.tiles[7][7].water).toBeGreaterThan(b.tiles[7][7].water);
+  // tile (6,6): manhattan 2 from the tree → shaded in a, open in b
+  expect(a.tiles[6][6].water).toBeGreaterThan(b.tiles[6][6].water);
 });
 
 test("shade slows grass growth but not tree growth", () => {
   const mk = (kind) => {
     const g = soilGrid("fishkill", 99, 80);
     g.tiles[5][5].plant = { kind: "tree", growth: 100 }; // shade source
-    g.tiles[7][7].plant = { kind, growth: 10 };
+    g.tiles[6][6].plant = { kind, growth: 10 };
     return g;
   };
   // grass under shade vs open
   const ga = mk("grass"), gb = soilGrid("fishkill", 99, 80);
-  gb.tiles[7][7].plant = { kind: "grass", growth: 10 };
+  gb.tiles[6][6].plant = { kind: "grass", growth: 10 };
   const g0 = 10;
   tickGrid(ga, fixedRand(5), 1e9);
   tickGrid(gb, fixedRand(5), 1e9);
-  const shadedGain = ga.tiles[7][7].plant.growth - g0;
-  const openGain = gb.tiles[7][7].plant.growth - g0;
+  const shadedGain = ga.tiles[6][6].plant.growth - g0;
+  const openGain = gb.tiles[6][6].plant.growth - g0;
   expect(shadedGain).toBeGreaterThan(0);
   expect(shadedGain).toBeLessThan(openGain);
   // tree under shade: unaffected
   const ta = mk("tree"), tb = soilGrid("fishkill", 99, 80);
-  tb.tiles[7][7].plant = { kind: "tree", growth: 10 };
+  tb.tiles[6][6].plant = { kind: "tree", growth: 10 };
   tickGrid(ta, fixedRand(5), 1e9);
   tickGrid(tb, fixedRand(5), 1e9);
-  const tShaded = ta.tiles[7][7].plant.growth - g0;
-  const tOpen = tb.tiles[7][7].plant.growth - g0;
+  const tShaded = ta.tiles[6][6].plant.growth - g0;
+  const tOpen = tb.tiles[6][6].plant.growth - g0;
   expect(Math.abs(tShaded - tOpen)).toBeLessThan(1e-9);
 });
 
