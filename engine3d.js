@@ -366,6 +366,12 @@ function Scene3D(renderer, Models) {
   this.clouds = [];
   this.hoverTile = null;   // {plot,x,y}
   this.time = 0;
+  // germination FX: pooled particles + per-tile stage-pop tracking
+  this.particles = [];
+  this.PARTICLE_MAX = 320;
+  this.popMap = new Map(); // "plot:x:y" -> {stage, start} (start=-Inf: no pop)
+  this.lastFxT = 0;
+  this._fxRand = null;
 }
 
 Scene3D.prototype.plotKeys = ["fishkill", "brooklyn"];
@@ -430,6 +436,9 @@ Scene3D.prototype.terrainColors = function (grids, cold) {
       const moist = Math.min(1, tile.water / 100);
       c = M.mix3(M.PAL.soil, M.PAL.soilDeep, moist * 0.55 + m.shade * 0.25);
     }
+    // canopy shade: subtle darkening under tree cover (sim canopyShade 0-3)
+    const cs = tile.canopyShade || 0;
+    if (cs > 0) c = M.mix3(c, [0.14, 0.11, 0.085], Math.min(0.32, cs * 0.10));
     if (cold) c = M.mix3(c, M.PAL.cold, 0.25);
     for (let v = 0; v < nvTile; v++) {
       const o = (i * nvTile + v) * 4;
@@ -455,6 +464,9 @@ Scene3D.prototype.buildPlants = function (grids, rand, now) {
       if (p) {
         const g = p.growth;
         let m = M.mTranslate(w.x, topY, w.z);
+        // stage pop: brief overshoot when crossing a growth-stage boundary
+        const ps = this.popScaleAt(key, x, y, now);
+        if (ps !== 1) m = M.mMul(m, M.mScale(ps, ps, ps));
         // per-plant variation, deterministic per tile (no two plants identical)
         const jitter = M.plantJitter(tile.shade, x, y);
         if (p.kind === "grass") {
@@ -467,9 +479,13 @@ Scene3D.prototype.buildPlants = function (grids, rand, now) {
         } else {
           const L = M.tree(rand, g, jitter);
           this._mergeAt(b, L, m, cold);
-          if (g > 40) {
-            // blob shadow
-            b.add(M.disc(0.55 + g / 100 * 0.5, 10, M.PAL.shadow.concat([0.26])), M.mTranslate(w.x, topY + 0.015, w.z));
+          // canopy shade disc, sized to the sim shade radius (mirrors
+          // app.js shadeRadiusFor: 0 below 60, 1 at 60-99, 2 at 100).
+          // Rebuilt per tick, so it grows with the tree and vanishes on burn.
+          const sr = g >= 100 ? 2 : g >= 60 ? 1 : 0;
+          if (sr > 0) {
+            b.add(M.disc(0.5 + sr * 0.85, 14, M.PAL.shadow.concat([0.30])),
+              M.mTranslate(w.x, topY + 0.012, w.z));
           }
         }
       }
@@ -586,6 +602,20 @@ Scene3D.prototype.buildFx = function (state) {
     const H = M.highlightRing(0);
     this._mergeAt(b, H, M.mTranslate(w.x, topY + 0.16, w.z), false);
   }
+  // germination particles: motes rise and fade, rings expand and fade
+  for (const p of this.particles) {
+    const k = Math.min(1, p.life / p.maxLife);
+    if (p.kind === "mote") {
+      const a = (1 - k) * 0.9;
+      b.add(M.box(p.size, p.size, p.size, [p.r, p.g, p.b, a]),
+        M.mTranslate(p.x, p.y, p.z));
+    } else { // ring pulse
+      const r = p.r0 + (p.r1 - p.r0) * k;
+      const a = (1 - k) * 0.7;
+      b.add(M.ring(r, r + 0.05, 18, [p.r, p.g, p.b, a]),
+        M.mTranslate(p.x, p.y, p.z));
+    }
+  }
   return b.finish();
 };
 
@@ -644,10 +674,63 @@ Scene3D.prototype.buildDecor = function (grids) {
   }
   return b.finish();
 };
+// Germination burst at a tile: green motes + expanding ring. No-op under
+// reduced motion (plants just appear).
+Scene3D.prototype.spawnGermination = function (plotKey, x, y, reducedMotion) {
+  if (reducedMotion) return;
+  const w = tileToWorld(plotKey, x, y);
+  const ti = (plotKey === "fishkill" ? 0 : SIZE16 * SIZE16) + y * SIZE16 + x;
+  const topY = this.terrain ? this.terrain.heights[ti] : 0;
+  if (!this._fxRand) this._fxRand = mulberryLike((Date.now() % 100000) + 1);
+  spawnGerminationBurst(this.particles, this.PARTICLE_MAX, w.x, topY + 0.05, w.z, this._fxRand);
+};
+
+// Stage-pop tracking: compare each tile's plant stage against render state.
+// On a stage increase, record the pop start; returns true while any pop is
+// still animating (500ms). Under reduced motion, stages update with no pop.
+Scene3D.prototype.updatePops = function (grids, now, reducedMotion) {
+  const M = this.M;
+  let active = false;
+  for (const key of this.plotKeys) {
+    const grid = grids[key];
+    for (let y = 0; y < SIZE16; y++) for (let x = 0; x < SIZE16; x++) {
+      const k = key + ":" + x + ":" + y;
+      const p = grid.tiles[y][x].plant;
+      if (!p) { this.popMap.delete(k); continue; }
+      const st = M.plantStage(p.kind, p.growth);
+      const prev = this.popMap.get(k);
+      if (!prev) {
+        this.popMap.set(k, { stage: st, start: -Infinity });
+      } else if (st !== prev.stage) {
+        this.popMap.set(k, {
+          stage: st,
+          start: st > prev.stage && !reducedMotion ? now : -Infinity,
+        });
+      }
+      const e = this.popMap.get(k);
+      if (now - e.start < 500) active = true;
+    }
+  }
+  return active;
+};
+// Pop scale for a tile at time now: 1.25 → 1.0 with an easeOutBack bounce.
+Scene3D.prototype.popScaleAt = function (key, x, y, now) {
+  const e = this.popMap.get(key + ":" + x + ":" + y);
+  if (!e || e.start === -Infinity) return 1;
+  return this.M.popScale(now - e.start, 500);
+};
 // Per-frame: rebuild fx, compute matrices, draw everything.
 Scene3D.prototype.renderFrame = function (state) {
   // state: {grids, falling, now, reducedMotion, seasonProgress, rand, wind}
   const r = this.r;
+  // germination particles advance every frame (dt clamped for tab-switch spikes)
+  const dt = Math.min(0.1, Math.max(0, (state.now - (this.lastFxT || state.now)) / 1000));
+  this.lastFxT = state.now;
+  updateParticles(this.particles, dt);
+  // stage pops: detect boundary crossings, then rebuild the plant layer so the
+  // 500ms overshoot animates smoothly instead of baking once per sim tick
+  const popsActive = this.updatePops(state.grids, state.now, state.reducedMotion);
+  if (popsActive) this.syncPlants(state.grids, state.rand, state.now);
   const fx = this.buildFx(state);
   r.upload(this.fxLayer, fx);
   const cam = this.camera;
@@ -701,12 +784,56 @@ function sunPosition(seasonProgress) {
   ];
 }
 
+/* ---------------- germination particles (pooled, pure data) ---------------- */
+// A germination burst: 6-10 small green motes that rise and fade over ~0.8s,
+// plus one expanding ring pulse on the tile (~0.5s). Pooled: when full, the
+// oldest particle is evicted. Returns the number spawned (motes + ring).
+// Pure — no GL — so tests can assert counts and motion without a context.
+function spawnGerminationBurst(pool, maxCount, x, y, z, rand) {
+  let n = 0;
+  const motes = 6 + Math.floor(rand() * 5); // 6-10
+  for (let i = 0; i < motes; i++) {
+    if (pool.length >= maxCount) pool.shift();
+    const a = rand() * Math.PI * 2, sp = 0.3 + rand() * 0.7;
+    pool.push({
+      kind: "mote",
+      x: x + (rand() - 0.5) * 0.3, y: y + 0.08, z: z + (rand() - 0.5) * 0.3,
+      vx: Math.cos(a) * sp * 0.4, vy: 1.1 + rand() * 0.9, vz: Math.sin(a) * sp * 0.4,
+      life: 0, maxLife: 0.8, size: 0.035 + rand() * 0.03,
+      r: 0.45 + rand() * 0.2, g: 0.72, b: 0.30,
+    });
+    n++;
+  }
+  if (pool.length < maxCount) {
+    pool.push({
+      kind: "ring", x, y: y + 0.03, z,
+      life: 0, maxLife: 0.5, r0: 0.15, r1: 0.8,
+      r: 0.55, g: 0.75, b: 0.35,
+    });
+    n++;
+  }
+  return n;
+}
+// Advance all particles by dt seconds; dead ones are removed. Pure.
+function updateParticles(pool, dt) {
+  for (let i = pool.length - 1; i >= 0; i--) {
+    const p = pool[i];
+    p.life += dt;
+    if (p.life >= p.maxLife) { pool.splice(i, 1); continue; }
+    if (p.kind === "mote") {
+      p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+      p.vy *= Math.max(0, 1 - 1.8 * dt); // drag: rise eases out
+    }
+  }
+}
+
 const Engine3D = {
   PLOT, TILE, tileToWorld, worldToTile,
   mIdent4, mMul4, mPerspective, mLookAt, mInverse, xform4,
   Camera, CAM, screenRay, rayPlaneY, pickTile,
   VS_SRC, FS_SRC, compileShader, createProgram, createRenderer,
   Scene3D, sunPosition, mulberryLike,
+  spawnGerminationBurst, updateParticles,
 };
 
 if (typeof module !== "undefined" && typeof module.exports !== "undefined") {

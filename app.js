@@ -80,6 +80,7 @@ function createTile(env, rand) {
     fire: 0,           // 0-100 intensity
     ash: 0,            // fertility memory after fire (0-1)
     shade: rand(),     // static organic variation for rendering
+    canopyShade: 0,    // tree-canopy shade count 0-3, recomputed each tick
   };
 }
 
@@ -133,10 +134,34 @@ function radiusTiles(x, y, r) {
   return out;
 }
 
+/* ---------------- tree canopy shade (sim) ---------------- */
+// Chebyshev shade radius cast by a tree: 0 below 60 growth, 1 at 60-99,
+// 2 at full maturity. Only trees cast shade.
+function shadeRadiusFor(kind, growth) {
+  if (kind !== "tree") return 0;
+  if (growth >= 100) return 2;
+  if (growth >= 60) return 1;
+  return 0;
+}
+// Recompute per-tile canopyShade counts (capped at 3). Cheap: 512 tiles.
+function computeShadeMap(grid) {
+  eachTile(grid, (t) => { t.canopyShade = 0; });
+  eachTile(grid, (t, x, y) => {
+    const p = t.plant;
+    if (!p) return;
+    const r = shadeRadiusFor(p.kind, p.growth);
+    if (r <= 0) return;
+    for (const [sx, sy] of radiusTiles(x, y, r)) {
+      const st = grid.tiles[sy][sx];
+      st.canopyShade = Math.min(3, st.canopyShade + 1);
+    }
+  });
+}
+
 /* ---------------- natural dispersal ---------------- */
 // Two-phase: gather births from mature plants, then germinate the suitable
 // ones. Unsuitable landings vanish, like real life. Seeded-RNG deterministic.
-function disperseSeeds(grid, rand, now) {
+function disperseSeeds(grid, rand, now, events) {
   if (now < grid.coldUntil) return; // growth paused
   const windActive = now < grid.windUntil;
   const births = [];
@@ -172,6 +197,7 @@ function disperseSeeds(grid, rand, now) {
     const t = grid.tiles[b.y][b.x];
     if (!t.plant && t.ground === "soil" && t.fire <= 0 && t.water > 25 && t.pollution < 60) {
       t.plant = { kind: b.kind, growth: b.growth };
+      if (events) events.push({ type: "germinate", x: b.x, y: b.y, kind: b.kind });
     }
   }
 }
@@ -221,15 +247,16 @@ function pickRingLanding(x, y, rMin, rMax, rand) {
 // never blocks placement or growth. Kind weights sum to 1 per environment.
 const DECOR_KINDS = {
   fishkill: [
-    ["leaf", 0.34], ["twig", 0.22], ["stone", 0.18],
-    ["pinecone", 0.12], ["pebble", 0.10], ["feather", 0.04],
+    ["leaf", 0.30], ["twig", 0.20], ["stone", 0.15], ["pinecone", 0.11],
+    ["pebble", 0.09], ["potshard", 0.08], ["straw", 0.05], ["feather", 0.02],
   ],
   brooklyn: [
-    ["paper", 0.30], ["pebble", 0.18], ["bottlecap", 0.18],
-    ["leaf", 0.16], ["twig", 0.10], ["button", 0.08],
+    ["paper", 0.24], ["pebble", 0.14], ["bottlecap", 0.14], ["leaf", 0.12],
+    ["sodacan", 0.10], ["twig", 0.08], ["button", 0.06], ["cardboard", 0.06],
+    ["brickchip", 0.04], ["glassshard", 0.02],
   ],
 };
-const DECOR_CAPS = { feather: 2, button: 3 }; // rare finds stay rare
+const DECOR_CAPS = { feather: 2, button: 3, glassshard: 4 }; // rare finds stay rare
 function pickDecorKind(kinds, counts, rand) {
   for (let a = 0; a < 8; a++) {
     const r = rand();
@@ -243,19 +270,42 @@ function pickDecorKind(kinds, counts, rand) {
 function scatterDecor(grid, rand) {
   const kinds = DECOR_KINDS[grid.envKey] || DECOR_KINDS.fishkill;
   const counts = {};
-  const n = 15 + Math.floor(rand() * 11); // 15-25 items
+  const n = 20 + Math.floor(rand() * 11); // 20-30 items
   const decor = [];
-  let guard = 0;
-  while (decor.length < n && guard++ < 600) {
-    const x = Math.floor(rand() * SIZE), y = Math.floor(rand() * SIZE);
+  const tileFree = (x, y) => {
     const t = grid.tiles[y][x];
     const p = t.plant;
-    if (p && p.growth >= PLANTS[p.kind].matureAt) continue; // never on mature plants
-    if (t.fire > 0) continue;
-    if (decor.some((d) => d.x === x && d.y === y)) continue; // one per tile
-    const kind = pickDecorKind(kinds, counts, rand);
+    if (p && p.growth >= PLANTS[p.kind].matureAt) return false; // never on mature plants
+    if (t.fire > 0) return false;
+    return !decor.some((d) => d.x === x && d.y === y); // one per tile
+  };
+  const drop = (kind, x, y) => {
     counts[kind] = (counts[kind] || 0) + 1;
     decor.push({ kind, x, y, rot: rand() * Math.PI * 2, scale: 0.8 + rand() * 0.4 });
+  };
+  let guard = 0;
+  if (grid.envKey === "fishkill") {
+    // weathered fence posts along the plot edges (rural built) — inside the budget
+    const want = 2 + Math.floor(rand() * 2); // 2-3
+    let placed = 0;
+    guard = 0;
+    while (placed < want && guard++ < 200 && decor.length < n) {
+      const edge = Math.floor(rand() * 4);
+      let x, y;
+      if (edge === 0) { x = Math.floor(rand() * SIZE); y = 0; }
+      else if (edge === 1) { x = Math.floor(rand() * SIZE); y = SIZE - 1; }
+      else if (edge === 2) { x = 0; y = Math.floor(rand() * SIZE); }
+      else { x = SIZE - 1; y = Math.floor(rand() * SIZE); }
+      if (!tileFree(x, y)) continue;
+      drop("fencepost", x, y);
+      placed++;
+    }
+  }
+  guard = 0;
+  while (decor.length < n && guard++ < 900) {
+    const x = Math.floor(rand() * SIZE), y = Math.floor(rand() * SIZE);
+    if (!tileFree(x, y)) continue;
+    drop(pickDecorKind(kinds, counts, rand), x, y);
   }
   grid.decor = decor;
 }
@@ -301,6 +351,9 @@ function tickGrid(grid, rand, now) {
   }
 
   const isRaining = now < grid.rainUntil;
+  // tree canopy shade: recompute before the tile loop so evaporation and
+  // growth see this tick's shade map
+  computeShadeMap(grid);
   eachTile(grid, (t, x, y) => {
     // rain: soak + extinguish
     if (isRaining) {
@@ -326,8 +379,9 @@ function tickGrid(grid, rand, now) {
         }
       }
     }
-    // evaporation
-    t.water = Math.max(0, t.water - (isRaining ? 0 : 1.6));
+    // evaporation (shaded soil dries slower)
+    const csh = t.canopyShade || 0;
+    t.water = Math.max(0, t.water - (isRaining ? 0 : 1.6 * (1 - 0.25 * csh)));
     // pollution drifts slowly down
     t.pollution = Math.max(0, t.pollution - 0.25);
 
@@ -342,13 +396,14 @@ function tickGrid(grid, rand, now) {
         rate *= 1 + t.ash * 0.6;                       // ash-fed soil
         if (hasMatureFlowerNeighbor(grid, x, y)) rate *= 1.15; // pollinators
         if (t.water < spec.waterNeed + 10) rate *= 0.6; // thirsty
+        if (p.kind !== "tree" && csh > 0) rate *= (1 - 0.12 * csh); // shade slows understory
         p.growth = Math.min(100, p.growth + rate);
       }
     }
   });
 
   // natural dispersal pass (uses updated maturity)
-  disperseSeeds(grid, rand, now);
+  disperseSeeds(grid, rand, now, events);
 
   return events;
 }
@@ -877,6 +932,8 @@ function placeAt(envKey, x, y) {
     consumeSelected();
     Sound.pluck();
     if (res.extinguished) Sound.rainStop();
+    if (Game.scene3d && /_seed$/.test(item.type))
+      Game.scene3d.spawnGermination(envKey, x, y, Game.reducedMotion);
   } else {
     Sound.fail();
     const canvas = Game.els.scene;
@@ -1071,6 +1128,8 @@ function gameTick() {
     for (const e of evs) {
       if (e.type === "ignite") Sound.thud();
       if (e.type === "rain") Sound.rainStart();
+      if (e.type === "germinate" && Game.scene3d)
+        Game.scene3d.spawnGermination(key, e.x, e.y, Game.reducedMotion);
     }
     if (now >= grid.rainUntil) Sound.rainStop();
   }
@@ -1160,6 +1219,7 @@ if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
     createTile, createGrid, eachTile, inBounds, neighbors, radiusTiles,
     tickGrid, applyItem, scoreGrid, countPlants,
     disperseSeeds, pickKernelLanding, pickRingLanding, windLevel,
+    shadeRadiusFor, computeShadeMap,
     scatterDecor, pickDecorKind, DECOR_KINDS, DECOR_CAPS,
     pickFallingItem, makeTrayItem, TRAY_CAP, HAZARD_TTL_MS,
     OPENING_HAIKU, CLOSING_HAIKU, fillHaiku, Sound, Game, landItem, resetSeason,

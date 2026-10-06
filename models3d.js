@@ -12,6 +12,7 @@ const PAL = {
   concrete: [0.62, 0.60, 0.56], concreteDeep: [0.48, 0.46, 0.43],
   ash: [0.23, 0.22, 0.21],
   grassA: [0.58, 0.70, 0.40], grassB: [0.24, 0.42, 0.20],
+  grassYoung: [0.74, 0.77, 0.45], // pale yellow-green: youth reads clearly
   wildGrass: [0.45, 0.55, 0.32],
   stem: [0.30, 0.46, 0.22],
   petals: [
@@ -20,6 +21,7 @@ const PAL = {
   ],
   petalCenter: [0.90, 0.77, 0.28],
   trunk: [0.35, 0.28, 0.20], leafA: [0.46, 0.58, 0.33], leafB: [0.19, 0.33, 0.16],
+  leafYoung: [0.62, 0.70, 0.38], // pale new canopy growth
   fireA: [0.95, 0.38, 0.10], fireB: [1.0, 0.72, 0.28],
   smoke: [0.52, 0.52, 0.50],
   water: [0.38, 0.58, 0.78],
@@ -41,6 +43,26 @@ function frac(x) { return x - Math.floor(x); }
 function easeOutCubic(t) {
   t = Math.max(0, Math.min(1, t));
   return 1 - Math.pow(1 - t, 3);
+}
+// Ease-out with overshoot: 0 → 1 with a bounce past 1 mid-way.
+function easeOutBack(t) {
+  t = Math.max(0, Math.min(1, t));
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+// Stage-pop scale: overshoots to ~1.25 at t=0, settles to 1.0 over durMs.
+function popScale(elapsedMs, durMs) {
+  if (elapsedMs >= durMs) return 1;
+  const t = Math.max(0, elapsedMs / durMs);
+  return 1 + 0.25 * (1 - easeOutBack(t));
+}
+// Growth stage index 0/1/2, matching the morph thresholds in the builders below.
+// Shared with the render layer so stage-pop detection uses identical boundaries.
+function plantStage(kind, growth) {
+  const g = easeOutCubic(Math.max(0, Math.min(1, growth / 100)));
+  if (kind === "grass") return g < 0.35 ? 0 : g < 0.7 ? 1 : 2;
+  if (kind === "flower") return g < 0.3 ? 0 : g < 0.65 ? 1 : 2;
+  return g < 0.3 ? 0 : g < 0.7 ? 1 : 2; // tree
 }
 // Deterministic per-plant RNG from a seed (stable across frames/ticks).
 function hashRand(seed) {
@@ -80,6 +102,10 @@ function mScale(sx, sy, sz) { const m = mIdent(); m[0] = sx; m[5] = sy; m[10] = 
 function mRotY(a) {
   const c = Math.cos(a), s = Math.sin(a);
   return [c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1];
+}
+function mRotX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1];
 }
 // column-major multiply: out = a * b
 function mMul(a, b) {
@@ -287,9 +313,12 @@ function grassTuft(rand, growth, jitter) {
   const j = jitter || defaultJitter(rand);
   const pr = j.rand || rand;
   const b = new Batcher();
-  // sparse tuft → full tuft: blade count grows with maturity
-  const blades = g < 0.35 ? 3 : g < 0.7 ? 4 : 6;
+  // sparse tuft → full tuft: blade count grows with maturity (see plantStage)
+  const stage = plantStage("grass", growth);
+  const blades = stage === 0 ? 3 : stage === 1 ? 4 : 6;
   const sway = [j.phase, 1.0];
+  // young blades are pale yellow-green; maturity deepens to saturated green
+  const bladeCol = (k) => hueShift(mix3(PAL.grassYoung, PAL.grassB, g * (0.35 + pr() * 0.65)), j.hue);
   for (let i = 0; i < blades; i++) {
     const a = (i / blades) * Math.PI * 2 + j.rot + pr() * 0.6;
     const tilt = 0.10 + pr() * 0.25;
@@ -297,8 +326,7 @@ function grassTuft(rand, growth, jitter) {
     if (h < 0.01) continue;
     const m = compose(Math.cos(a) * 0.14, 0, Math.sin(a) * 0.14, j.scale, j.scale, j.scale, 0);
     const lean = mMul(mTranslate(Math.cos(a) * tilt * h * 0.5, 0, Math.sin(a) * tilt * h * 0.5), m);
-    const col = hueShift(mix3(PAL.grassA, PAL.grassB, g * (0.3 + pr() * 0.7)), j.hue);
-    b.add(cone(0.045, h, 4, col), lean, null, sway);
+    b.add(cone(0.045, h, 4, bladeCol(i)), lean, null, sway);
   }
   return b.finish();
 }
@@ -310,31 +338,38 @@ function flower(rand, growth, colorIdx, jitter) {
   const b = new Batcher();
   const stemH = 0.14 + 0.30 * g; // mature ≈ 0.44 + bloom
   const sway = [j.phase, 1.0];
-  b.add(cyl(0.022, 0.032, stemH, 5, hueShift(PAL.stem, j.hue)),
+  const stage = plantStage("flower", growth);
+  // young stems are pale; they deepen as the plant matures
+  const stemCol = hueShift(mix3(PAL.grassYoung, PAL.stem, g), j.hue);
+  b.add(cyl(0.022, 0.032, stemH, 5, stemCol),
     mTranslate(0, 0, 0), null, sway);
-  if (g < 0.3) {
+  if (stage === 0) {
     // sprout: two tiny leaves, no head
     for (const s of [-1, 1]) {
-      b.add(cone(0.035, 0.12 * g / 0.3, 4, hueShift(PAL.grassB, j.hue)),
+      b.add(cone(0.035, 0.12 * g / 0.3, 4, hueShift(mix3(PAL.grassYoung, PAL.grassB, g), j.hue)),
         compose(s * 0.05, stemH * 0.5, 0, j.scale, j.scale, j.scale, 0), null, sway);
     }
     return b.finish();
   }
   const petal = hueShift(PAL.petals[colorIdx % PAL.petals.length], j.hue);
   const pr0 = 0.05 + 0.055 * g;
-  if (g < 0.65) {
+  if (stage === 1) {
     // bud: closed green head
     b.add(sphere(pr0 * 0.6, 6, hueShift(mix3(PAL.stem, PAL.grassA, 0.5), j.hue)),
       compose(0, stemH, 0, j.scale, 1.3 * j.scale, j.scale, 0), null, sway);
     return b.finish();
   }
-  // bloom: petals only at maturity
+  // bloom: petals only at maturity, with a slight emissive lift
   for (let i = 0; i < 5; i++) {
     const a = (i / 5) * Math.PI * 2 + j.rot + pr() * 0.4;
     const m = compose(Math.cos(a) * pr0, stemH, Math.sin(a) * pr0, j.scale, 0.45, j.scale, 0);
-    b.add(sphere(pr0 * 0.62, 5, petal), m, null, sway);
+    const pc = sphere(pr0 * 0.62, 5, petal);
+    pc.e = 0.18;
+    b.add(pc, m, null, sway);
   }
-  b.add(sphere(pr0 * 0.45, 5, PAL.petalCenter), mTranslate(0, stemH + pr0 * 0.2, 0), null, sway);
+  const cc = sphere(pr0 * 0.45, 5, PAL.petalCenter);
+  cc.e = 0.25;
+  b.add(cc, mTranslate(0, stemH + pr0 * 0.2, 0), null, sway);
   return b.finish();
 }
 
@@ -347,25 +382,27 @@ function tree(rand, growth, jitter) {
   const sway = [j.phase, 0.33]; // trees barely sway
   b.add(cyl((0.05 + 0.045 * g) * j.scale, (0.075 + 0.06 * g) * j.scale, trunkH, 6,
       hueShift(PAL.trunk, j.hue * 0.5)), mIdent(), null, [j.phase, 0.15]);
-  if (g < 0.3) {
+  // canopy color deepens with maturity: pale new growth → saturated mature
+  const leaf = (amt) => hueShift(mix3(PAL.leafYoung, PAL.leafB, amt), j.hue);
+  const stage = plantStage("tree", growth);
+  if (stage === 0) {
     // sapling: bare stem with a tuft of young leaves at the tip
-    b.add(sphere(0.10 * g / 0.3, 6, hueShift(mix3(PAL.leafA, PAL.grassB, 0.4), j.hue)),
+    b.add(sphere(0.10 * g / 0.3, 6, leaf(0.15)),
       mTranslate(0, trunkH, 0), null, sway);
     return b.finish();
   }
-  const leaf = hueShift(mix3(PAL.leafA, PAL.leafB, 0.3 + pr() * 0.5), j.hue);
-  if (g < 0.7) {
+  if (stage === 1) {
     // young: single small canopy
     const cr = 0.30 + 0.25 * g;
-    b.add(sphere(cr, 7, leaf), mTranslate(0, trunkH + cr * 0.7, 0), null, sway);
+    b.add(sphere(cr, 7, leaf(0.45 + pr() * 0.2)), mTranslate(0, trunkH + cr * 0.7, 0), null, sway);
     return b.finish();
   }
   // mature: full layered canopy, top ≈ 2.3 tile units
   const cr = 0.42 + 0.28 * g;
-  b.add(sphere(cr, 8, leaf), mTranslate(0, trunkH + cr * 0.75, 0), null, sway);
-  b.add(sphere(cr * 0.62, 7, hueShift(mix3(leaf, PAL.leafA, 0.4), j.hue)),
+  b.add(sphere(cr, 8, leaf(0.75 + pr() * 0.25)), mTranslate(0, trunkH + cr * 0.75, 0), null, sway);
+  b.add(sphere(cr * 0.62, 7, hueShift(mix3(leaf(0.8), PAL.leafA, 0.4), j.hue)),
     mTranslate(-cr * 0.35, trunkH + cr * 0.35, cr * 0.2), null, sway);
-  b.add(sphere(cr * 0.5, 7, hueShift(mix3(leaf, PAL.leafB, 0.3), j.hue)),
+  b.add(sphere(cr * 0.5, 7, hueShift(mix3(leaf(0.85), PAL.leafB, 0.3), j.hue)),
     mTranslate(cr * 0.3, trunkH + cr * 1.15, -cr * 0.15), null, sway);
   return b.finish();
 }
@@ -383,6 +420,22 @@ function flame(flicker) {
   return L;
 }
 
+// Flat annulus in the XZ plane at y=0 (germination ring pulse).
+function ring(rIn, rOut, seg, color) {
+  seg = seg || 18;
+  const p = [], n = [], idx = [];
+  for (let i = 0; i <= seg; i++) {
+    const a = (i / seg) * Math.PI * 2;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    p.push(ca * rIn, 0, sa * rIn, ca * rOut, 0, sa * rOut);
+    n.push(0, 1, 0, 0, 1, 0);
+  }
+  for (let i = 0; i < seg; i++) {
+    const b = i * 2;
+    idx.push(b, b + 1, b + 2, b + 1, b + 3, b + 2);
+  }
+  return chunk(p, n, color, idx);
+}
 // Flat horizontal quad in XZ plane at y=0 (for leaves, feathers).
 function quad(color) {
   return chunk(
@@ -393,7 +446,8 @@ function quad(color) {
 }
 
 // Ephemera: strewn ground litter, purely decorative, one batched draw each.
-// kind: leaf|twig|stone|pinecone|feather|pebble|paper|bottlecap|button
+// kind: leaf|twig|stone|pinecone|feather|pebble|paper|bottlecap|button|
+//       sodacan|cardboard|brickchip|glassshard|potshard|fencepost|straw
 function decorItem(kind, rand) {
   const b = new Batcher();
   const R = rand || Math.random;
@@ -435,6 +489,41 @@ function decorItem(kind, rand) {
       b.add(cyl(0.028, 0.028, 0.012, 8,
         [[0.42, 0.36, 0.30], [0.30, 0.38, 0.42], [0.52, 0.28, 0.26]][Math.floor(R() * 3)]),
         mTranslate(0, 0.008, 0));
+      break;
+    case "sodacan": { // crushed can: squashed metallic cylinder, silver or red
+      const c = R() < 0.5 ? [0.70, 0.72, 0.74] : [0.66, 0.20, 0.15];
+      const can = cyl(0.05, 0.055, 0.07, 8, c);
+      can.e = 0.25; // metallic glint
+      b.add(can, compose(0, 0.018, 0, 1.25, 0.5, 1.1, R() * Math.PI));
+      break;
+    }
+    case "cardboard": { // tilted tan scrap
+      const m = mMul(mTranslate(0, 0.03, 0), mMul(mRotX(0.14 + R() * 0.1), mRotY(R() * Math.PI)));
+      b.add(box(0.30, 0.015, 0.22, [0.72, 0.62, 0.45]), m);
+      break;
+    }
+    case "brickchip": // small terracotta tetra
+      b.add(cone(0.05, 0.07, 4, [0.62, 0.32, 0.22]), compose(0, 0.01, 0, 1, 1, 1, R() * Math.PI));
+      break;
+    case "glassshard": { // tiny pale-blue triangle with a glint
+      const sh = cone(0.045, 0.025, 3, [0.75, 0.88, 0.95]);
+      sh.e = 0.8;
+      b.add(sh, compose(0, 0.012, 0, 1, 1, 1, R() * Math.PI));
+      break;
+    }
+    case "potshard": { // angled terracotta shard (rural built)
+      const m = mMul(mTranslate(0, 0.035, 0),
+        mMul(mRotX(0.5 + R() * 0.3), mMul(mRotY(R() * Math.PI), mScale(0.30, 1, 0.22))));
+      b.add(quad([0.58, 0.32, 0.20]), m);
+      break;
+    }
+    case "fencepost": // weathered grey-brown post at the plot edge
+      b.add(box(0.09, 0.55, 0.09, [0.45, 0.38, 0.30]), mTranslate(0, 0, 0));
+      b.add(box(0.11, 0.03, 0.11, [0.38, 0.32, 0.26]), mTranslate(0, 0.55, 0)); // cap
+      break;
+    case "straw": // pale-yellow stalk lying flat
+      b.add(cyl(0.008, 0.008, 0.18, 4, [0.82, 0.74, 0.45]),
+        mMul(mTranslate(0, 0.015, 0), mRotX(Math.PI / 2 * (0.92 + R() * 0.12))));
       break;
     default:
       b.add(box(0.06, 0.02, 0.06, [0.5, 0.5, 0.5]), mTranslate(0, 0.01, 0));
@@ -586,9 +675,10 @@ function validIndices(layer) {
 }
 
 const Models3D = {
-  PAL, lerp, mix3, frac, easeOutCubic, hashRand, hueShift, plantJitter, defaultJitter,
-  mIdent, mTranslate, mScale, mRotY, mMul, compose, xformPoint, xformNormal,
-  Batcher, chunk, box, cone, cyl, sphere, disc, streak, quad,
+  PAL, lerp, mix3, frac, easeOutCubic, easeOutBack, popScale, plantStage,
+  hashRand, hueShift, plantJitter, defaultJitter,
+  mIdent, mTranslate, mScale, mRotY, mRotX, mMul, compose, xformPoint, xformNormal,
+  Batcher, chunk, box, cone, cyl, sphere, disc, streak, quad, ring,
   grassTuft, flower, tree, flame, smokePuff, decorItem, cloudCluster, sunBall, skyDome,
   tokenFor, mergeLayer, translateLayer, highlightRing, bboxOf, validIndices,
 };

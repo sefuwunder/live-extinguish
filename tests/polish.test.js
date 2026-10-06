@@ -271,14 +271,14 @@ test("fire spreads slowly: halved probability, drier fuel, every other tick", ()
 
 /* ---------------- 5. ephemera ---------------- */
 
-const FISHKILL_KINDS = new Set(DECOR_KINDS.fishkill.map(([k]) => k));
+const FISHKILL_KINDS = new Set(DECOR_KINDS.fishkill.map(([k]) => k).concat(["fencepost"]));
 const BROOKLYN_KINDS = new Set(DECOR_KINDS.brooklyn.map(([k]) => k));
 
-test("decor counts per plot are 15-25 and env-appropriate", () => {
+test("decor counts per plot are 20-30 and env-appropriate", () => {
   for (const env of ["fishkill", "brooklyn"]) {
     const g = createGrid(env, fixedRand(8000 + env.length));
-    expect(g.decor.length).toBeGreaterThanOrEqual(15);
-    expect(g.decor.length).toBeLessThanOrEqual(25);
+    expect(g.decor.length).toBeGreaterThanOrEqual(20);
+    expect(g.decor.length).toBeLessThanOrEqual(30);
     const allowed = env === "fishkill" ? FISHKILL_KINDS : BROOKLYN_KINDS;
     for (const d of g.decor) expect(allowed.has(d.kind)).toBe(true);
   }

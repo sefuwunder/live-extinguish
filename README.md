@@ -39,6 +39,8 @@ Each tile tracks ground (soil/concrete), water 0–100, pollution 0–100, a pla
 - Water evaporates; rain soaks and kills all fire; heat ignites dry planted tiles.
 - Fire spreads to dry neighbors, destroys plants, leaves **ash** that feeds what comes next. Slash-and-burn has a purpose.
 - Grass spreads to adjacent empty soil at maturity. Trees are slow and precious.
+- **Tree shade:** mature trees shade the ground — growth ≥60 shades a Chebyshev radius of 1, growth 100 shades radius 2. Shaded soil evaporates slower (×(1 − 0.25 × shade)) and grass/flowers grow slower under canopy (×(1 − 0.12 × shade)); trees don't mind the shade.
+- **Growth is an event:** seeds burst into 6–10 rising green motes plus a soft ring pulse; crossing a growth stage pops the plant to 1.25× scale, settling with an easeOutBack bounce over 0.5s. Young growth is pale yellow-green, maturity a deep saturated green.
 - **LIVE score:** grass ×1 + flowers ×3 + trees ×5 per grid (half value while young).
 - **EXTINGUISH:** fires put out, counted with quiet pride.
 
