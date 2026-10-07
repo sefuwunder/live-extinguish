@@ -25,7 +25,9 @@ function rngFromQuery() {
 /* ---------------- constants ---------------- */
 const SIZE = 16;
 const TICK_MS = 800;
-const SEASON_MS = 5 * 60 * 1000;
+// A round lasts until a tree reaches full fruition (growth 100); the cap is
+// a backstop so a round can't run forever if no tree is ever tended.
+const ROUND_CAP_MS = 20 * 60 * 1000;
 
 const ITEMS = {
   grass_seed:  { icon: "🌱", cat: "seed",  label: "grass seed" },
@@ -46,7 +48,7 @@ const ITEM_KEYS = Object.keys(ITEMS);
 const PLANTS = {
   grass:  { matureAt: 60,  value: 1, baseRate: 2.6, waterNeed: 20 },
   flower: { matureAt: 80,  value: 3, baseRate: 1.6, waterNeed: 30 },
-  tree:   { matureAt: 100, value: 5, baseRate: 0.85, waterNeed: 40 },
+  tree:   { matureAt: 100, value: 5, baseRate: 0.16, waterNeed: 40 },
 };
 
 // Fire tuning: small, slow fires. Intensity capped at FIRE_MAX; a water
@@ -744,19 +746,26 @@ function makeTrayItem(itemKey, now) {
 
 /* ---------------- haikus (pre-written, no generation) ---------------- */
 const OPENING_HAIKU = [
-  "first rain on concrete —\neven brooklyn dreams in green",
-  "sixteen feet of earth —\nthe sky keeps dropping small gifts",
-  "dawn over fishkill —\na seed does not ask permission",
-  "two small fields of maybe —\nchoose where the sky should fall",
-  "morning, and the wind\ncarries seeds it cannot name —\nplant them anyway",
+  "a crown is coming —\none tree will finish the round\nwhich plot will it be",
+  "plant for the long green —\nthe first full crown ends the day\nwater like you mean it",
+  "sixteen feet of earth —\nraise one tree to its full crown\nthe sky is watching",
+  "slow green, deep roots —\nthe round lasts until a crown\npatience is a seed",
 ];
-const CLOSING_HAIKU = [
-  "the season closes —\n{winner} keeps the warmer soil.\n{total} green, breathing.",
-  "five minutes of sky —\n{winner} sang, {loser} hummed along.\n{total} lives took root.",
-  "dusk on sixteen feet —\nwhat you tended, tended you.\n{total} green, still growing.",
+const FRUITION_HAIKU = [
+  "the crown is full —\n{plot} raised it in {time}\nthe sky bows a little.",
+  "full crown, deep shade —\n{plot} did it in {time}\n{total} green, breathing.",
+  "one tree, finished —\n{plot} tended {time} of sky\nnow the shade is yours.",
+  "gold on the top leaf —\n{plot} grew a crown in {time}\nrest now, gardener.",
 ];
-function fillHaiku(tpl, winner, loser, total) {
-  return tpl.replace("{winner}", winner).replace("{loser}", loser).replace("{total}", String(total));
+const BACKSTOP_HAIKU = [
+  "twenty minutes gone —\nno crown, but the soil is soft\ntry the sky again.",
+  "the round slips away —\nroots were slow, the rain was shy\nnext time, water more.",
+];
+function fillHaiku(tpl, vars) {
+  const v = vars || {};
+  return tpl.replace("{winner}", v.winner || "").replace("{loser}", v.loser || "")
+    .replace("{total}", String(v.total == null ? "" : v.total))
+    .replace("{plot}", v.plot || "").replace("{time}", v.time || "");
 }
 const SEASON_NAMES = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
 
@@ -984,6 +993,7 @@ const Game = {
   clouds: { fishkill: [], brooklyn: [] },
   selected: null,       // { trayIdx, itemId }
   season: 1,
+  startedAt: 0,
   endsAt: 0,
   running: false,
   reducedMotion: false,
@@ -1008,7 +1018,8 @@ function resetSeason() {
   Game.nextFallTray = 0;
   Game.clouds.fishkill = newClouds(rand, 384);
   Game.clouds.brooklyn = newClouds(rand, 384);
-  Game.endsAt = Date.now() + SEASON_MS;
+  Game.startedAt = Date.now();
+  Game.endsAt = Game.startedAt + ROUND_CAP_MS;
   // seed each tray with a couple of gifts so the player isn't waiting
   for (let i = 0; i < 3; i++) {
     landItem(0, makeTrayItem(pickFallingItem(rand), Date.now()));
@@ -1215,29 +1226,71 @@ function updateScores() {
   Game.els.extinguish.textContent = String(totalExt);
 }
 
-function seasonProgress(now) {
-  return Math.min(1, Math.max(0, 1 - (Game.endsAt - now) / SEASON_MS));
+/* round progress: the sun arcs from dawn to dusk as the nearest tree
+   approaches full fruition (growth 100). */
+function nearestCrown() {
+  let max = 0;
+  for (const key of ["fishkill", "brooklyn"]) {
+    const grid = Game.grids[key];
+    if (!grid || !grid.tiles) continue;
+    eachTile(grid, (t) => {
+      if (t.plant && t.plant.kind === "tree" && t.plant.growth > max) max = t.plant.growth;
+    });
+  }
+  return max;
 }
 
-function endSeason() {
+function seasonProgress(now) {
+  return Math.min(1, Math.max(0, nearestCrown() / 100));
+}
+
+/* which plot holds a fully-fruited tree, if any (fishkill wins ties) */
+function fruitedPlot() {
+  for (const key of ["fishkill", "brooklyn"]) {
+    const grid = Game.grids[key];
+    let crowned = false;
+    eachTile(grid, (t) => {
+      if (t.plant && t.plant.kind === "tree" && t.plant.growth >= 100) crowned = true;
+    });
+    if (crowned) return key;
+  }
+  return null;
+}
+
+function endSeason(reason, plotKey) {
   Game.running = false;
   Sound.rainStop();
   const sf = scoreGrid(Game.grids.fishkill), sb = scoreGrid(Game.grids.brooklyn);
   const total = Math.round(sf.total + sb.total);
   const winner = sf.total >= sb.total ? "fishkill" : "brooklyn";
   const loser = winner === "fishkill" ? "brooklyn" : "fishkill";
-  const tpl = CLOSING_HAIKU[Math.floor(Game.rand() * CLOSING_HAIKU.length)];
-  // archive best
+  const elapsed = Date.now() - Game.startedAt;
+  const timeStr = fmtClock(elapsed);
+  let tpl;
+  if (reason === "fruition") {
+    tpl = FRUITION_HAIKU[Math.floor(Game.rand() * FRUITION_HAIKU.length)];
+    // fastest fruition record
+    try {
+      const prev = JSON.parse(localStorage.getItem("live-extinguish-fastest") || "null");
+      if (!prev || elapsed < prev.ms)
+        localStorage.setItem("live-extinguish-fastest", JSON.stringify({ ms: elapsed, plot: plotKey, season: Game.season }));
+    } catch (e) { /* storage unavailable */ }
+  } else {
+    tpl = BACKSTOP_HAIKU[Math.floor(Game.rand() * BACKSTOP_HAIKU.length)];
+  }
+  // archive best live score
   try {
     const prev = JSON.parse(localStorage.getItem("live-extinguish-best") || "null");
     if (!prev || total > prev.total)
       localStorage.setItem("live-extinguish-best", JSON.stringify({ total, fishkill: Math.round(sf.total), brooklyn: Math.round(sb.total), season: Game.season }));
   } catch (e) { /* storage unavailable */ }
   const best = (() => { try { return JSON.parse(localStorage.getItem("live-extinguish-best") || "null"); } catch (e) { return null; } })();
+  const fastest = (() => { try { return JSON.parse(localStorage.getItem("live-extinguish-fastest") || "null"); } catch (e) { return null; } })();
   showHaiku(
-    fillHaiku(tpl, winner, loser, total),
+    fillHaiku(tpl, { winner, loser, total, plot: plotKey, time: timeStr }),
     `fishkill ${Math.round(sf.total)} · brooklyn ${Math.round(sb.total)}` +
-    (best ? ` · best ${best.total}` : ""),
+    (best ? ` · best ${best.total}` : "") +
+    (fastest ? ` · fastest crown ${fmtClock(fastest.ms)}` : ""),
     "again"
   );
 }
@@ -1304,7 +1357,7 @@ function beginSeason() {
 function gameTick() {
   if (!Game.running) return;
   const now = Date.now();
-  if (now >= Game.endsAt) { endSeason(); return; }
+  if (now >= Game.endsAt) { endSeason("backstop"); return; }
   for (const key of ["fishkill", "brooklyn"]) {
     const grid = Game.grids[key];
     const evs = tickGrid(grid, Game.rand, now);
@@ -1316,6 +1369,9 @@ function gameTick() {
     }
     if (now >= grid.rainUntil) Sound.rainStop();
   }
+  // fruition: the round ends the moment any tree reaches full crown
+  const plot = fruitedPlot();
+  if (plot) { endSeason("fruition", plot); return; }
   // hazard expiry sweep (safety net beside per-item timeouts)
   for (let ti = 0; ti < 2; ti++)
     Game.trays[ti] = Game.trays[ti].filter((it) => !it.expiresAt || it.expiresAt > now);
@@ -1345,7 +1401,8 @@ function drawGrids(now) {
 function frame(nowMs) {
   if (Game.running) {
     const now = Date.now();
-    Game.els.clock.textContent = fmtClock(Game.endsAt - now);
+    Game.els.clock.textContent = fmtClock(now - Game.startedAt);
+    if (Game.els.crown) Game.els.crown.textContent = `nearest crown ${Math.floor(nearestCrown())}%`;
     drawGrids(now);
   }
   requestAnimationFrame(frame);
@@ -1360,7 +1417,7 @@ function boot() {
     slotsA: $("slotsA"), slotsB: $("slotsB"),
     scene: $("scene"), glFallback: $("glFallback"),
     scorefishkill: $("score-fishkill"), scorebrooklyn: $("score-brooklyn"),
-    extinguish: $("extinguishCount"), clock: $("clock"),
+    extinguish: $("extinguishCount"), clock: $("clock"), crown: $("crown"),
     seasonLabel: $("seasonLabel"), haiku: $("haiku"),
     haikuText: $("haikuText"), haikuBtn: $("haikuBtn"),
     muteBtn: $("muteBtn"), motionBtn: $("motionBtn"),
@@ -1397,7 +1454,7 @@ if (IS_BROWSER) boot();
 /* test exports (CJS interop for bun test) */
 if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
   module.exports = {
-    mulberry32, rngFromQuery, ITEMS, ITEM_KEYS, PLANTS, ENVS, SIZE, TICK_MS, SEASON_MS,
+    mulberry32, rngFromQuery, ITEMS, ITEM_KEYS, PLANTS, ENVS, SIZE, TICK_MS, ROUND_CAP_MS,
     FIRE_MAX, WATER_POWER, WATER_SPLASH,
     createTile, createGrid, eachTile, inBounds, neighbors, radiusTiles,
     tickGrid, applyItem, scoreGrid, countPlants,
@@ -1407,7 +1464,8 @@ if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
     BEE_MAX, BIRD_MS,
     scatterDecor, pickDecorKind, DECOR_KINDS, DECOR_CAPS,
     pickFallingItem, makeTrayItem, TRAY_CAP, HAZARD_TTL_MS,
-    OPENING_HAIKU, CLOSING_HAIKU, fillHaiku, Sound, Game, landItem, resetSeason,
+    OPENING_HAIKU, FRUITION_HAIKU, BACKSTOP_HAIKU, fillHaiku, nearestCrown, fruitedPlot, Sound, Game, landItem, resetSeason,
+    gameTick, endSeason,
     renderGrid, renderSky, TILE_PX, GRID_PX, selectItem, placeAt,
     // renderGrid/renderSky: legacy 2D renderer, kept for tests; the game uses WebGL.
   };

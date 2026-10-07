@@ -40,6 +40,7 @@ body {
 }
 .season-label { font-family: Georgia, serif; font-style: italic; }
 .clock { font-variant-numeric: tabular-nums; background: var(--paper-deep); border-radius: 999px; padding: 0.15rem 0.7rem; }
+.crown { font-variant-numeric: tabular-nums; font-size: 0.78rem; opacity: 0.62; }
 .ghost-btn {
   background: none; border: 1px solid var(--paper-deep); border-radius: 999px;
   font-size: 1rem; padding: 0.15rem 0.55rem; cursor: pointer; color: var(--ink-soft);

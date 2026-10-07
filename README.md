@@ -8,9 +8,9 @@
 2. Read the opening haiku, press **begin**.
 3. Items fall from the sky into two staging trays. **Tap a gift, then tap the earth** where it belongs — either grid.
 4. Grow grass 🌱, flowers 🌸, and trees 🌳. Tend water, clear smog, put out fires.
-5. After 5 minutes the season ends with a closing haiku and the totals. Best season is kept in localStorage.
+5. The round ends the moment any tree reaches full crown (growth 100) — a celebration naming the winning plot and the time it took. If no tree crowns within 20 minutes, the round closes wistfully. Best live score and fastest fruition are kept in localStorage.
 
-**Goal:** the most living green on *both* lands. Brooklyn's concrete is stubborn — convert it with 🟤 soil. Fishkill is generous but fire still visits.
+**Goal:** raise a tree to its full crown. A dedicated, watering player earns one in about 5–8 minutes. Brooklyn's concrete is stubborn — convert it with 🟤 soil and terraform patiently. Fishkill is generous but fire still visits.
 
 ## The gifts
 

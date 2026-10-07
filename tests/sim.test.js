@@ -315,8 +315,11 @@ test("tray cap refuses the 13th item", () => {
 });
 
 test("fillHaiku replaces tokens", () => {
-  expect(fillHaiku("{winner} over {loser}, {total} green", "fishkill", "brooklyn", 42))
+  expect(fillHaiku("{winner} over {loser}, {total} green", { winner: "fishkill", loser: "brooklyn", total: 42 }))
     .toBe("fishkill over brooklyn, 42 green");
+  expect(fillHaiku("{plot} raised it in {time}", { plot: "fishkill", time: "6:24" }))
+    .toBe("fishkill raised it in 6:24");
+  expect(fillHaiku("no tokens here", {})).toBe("no tokens here");
 });
 
 test("neighbors and radius stay in bounds", () => {
